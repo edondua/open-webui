@@ -22,6 +22,8 @@ OPENAI_EMBED_MODEL = os.getenv("MEMORY_OPENAI_MODEL", "text-embedding-3-small")
 EMBEDDING_DIM = int(os.getenv("MEMORY_EMBEDDING_DIM", "1536"))
 OPENAI_BASE_URL = os.getenv("MEMORY_OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 TIMEOUT_SECONDS = int(os.getenv("MEMORY_TIMEOUT_SECONDS", "30"))
+VECTOR_INDEX_LISTS = int(os.getenv("MEMORY_VECTOR_INDEX_LISTS", "100"))
+VECTOR_PROBES = int(os.getenv("MEMORY_VECTOR_PROBES", "10"))
 
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -167,12 +169,26 @@ def init_db() -> None:
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_tags ON memory_docs USING GIN (tags)")
             cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_memory_docs_embedding
+                ON memory_docs USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = {VECTOR_INDEX_LISTS})
+                """
+            )
+            cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_memory_evidence_fts
                 ON memory_evidence USING GIN (to_tsvector('simple', coalesce(question,'') || ' ' || coalesce(summary,'') || ' ' || coalesce(snippet,'')))
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_evidence_tags ON memory_evidence USING GIN (tags)")
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_memory_evidence_embedding
+                ON memory_evidence USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = {VECTOR_INDEX_LISTS})
+                """
+            )
 
 
 def embed_text(text: str) -> list[float] | None:
@@ -356,6 +372,8 @@ def _search_table(
 
     with db_conn() as conn:
         with conn.cursor() as cur:
+            if q_vec_literal is not None:
+                cur.execute("SET LOCAL ivfflat.probes = %s", (VECTOR_PROBES,))
             cur.execute(sql, run_params)
             rows = cur.fetchall()
             cols = [d.name for d in cur.description]
