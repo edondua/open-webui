@@ -55,8 +55,11 @@ def _is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USERS
 
 
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+
+
 async def _call_openwebui(messages: list[dict]) -> str:
-    """Call Open WebUI chat completions with streaming, return full response."""
+    """Call Open WebUI chat completions with streaming and automatic retry on 429."""
     headers = {
         "Authorization": f"Bearer {OPENWEBUI_API_KEY}",
         "Content-Type": "application/json",
@@ -67,35 +70,44 @@ async def _call_openwebui(messages: list[dict]) -> str:
         "stream": True,
     }
 
-    full_text = ""
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream(
-            "POST",
-            f"{OPENWEBUI_API_URL}/api/chat/completions",
-            headers=headers,
-            json=payload,
-        ) as resp:
-            if resp.status_code >= 400:
-                body = await resp.aread()
-                log.error("Open WebUI error %s: %s", resp.status_code, body[:500])
-                return f"Error from AI backend ({resp.status_code}). Please try again."
-
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        full_text += content
-                except (json.JSONDecodeError, IndexError, KeyError):
+    for attempt in range(MAX_RETRIES):
+        full_text = ""
+        async with httpx.AsyncClient(timeout=180) as client:
+            async with client.stream(
+                "POST",
+                f"{OPENWEBUI_API_URL}/api/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("retry-after", 2 ** attempt * 3))
+                    log.warning("Rate limited (429), retrying in %ss (attempt %s/%s)", retry_after, attempt + 1, MAX_RETRIES)
+                    await asyncio.sleep(retry_after)
                     continue
 
-    return full_text.strip() or "No response from the model."
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    log.error("Open WebUI error %s: %s", resp.status_code, body[:500])
+                    return f"Error from AI backend ({resp.status_code}). Please try again."
+
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            full_text += content
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        continue
+
+        return full_text.strip() or "No response from the model."
+
+    return "The AI backend is busy right now. Please try again in a minute."
 
 
 async def _send_long(update: Update, text: str) -> None:
