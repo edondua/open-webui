@@ -116,9 +116,13 @@ async def _stream_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str
                         await _safe_edit(placeholder, error_msg)
                         return error_msg
 
-                    # Use aiter_lines with a keepalive wrapper so we can
-                    # update the placeholder even when the AI is using tools
-                    # and no tokens are streaming yet.
+                    # Read the full stream — do NOT break on [DONE].
+                    # When the AI uses tools, Open WebUI sends multiple
+                    # rounds in one stream:
+                    #   round 1: planning text → [DONE]
+                    #   (tool call happens server-side)
+                    #   round 2: final answer with tool data → [DONE]
+                    # We must read until the HTTP connection closes.
                     async for line in _iter_lines_with_keepalive(
                         resp, placeholder, full_text, last_edit, last_edit_text
                     ):
@@ -126,7 +130,12 @@ async def _stream_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str
                             continue
                         data_str = line[6:].strip()
                         if data_str == "[DONE]":
-                            break
+                            # Don't break — more rounds may follow
+                            # Update placeholder with what we have so far
+                            if full_text.strip():
+                                preview = full_text.strip()[:TELEGRAM_MSG_LIMIT - 20]
+                                await _safe_edit(placeholder, preview + "\n\nUsing tools...")
+                            continue
                         try:
                             chunk = json.loads(data_str)
                             delta = chunk.get("choices", [{}])[0].get("delta", {})
