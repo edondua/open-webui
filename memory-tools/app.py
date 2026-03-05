@@ -24,6 +24,9 @@ OPENAI_BASE_URL = os.getenv("MEMORY_OPENAI_BASE_URL", "https://api.openai.com/v1
 TIMEOUT_SECONDS = int(os.getenv("MEMORY_TIMEOUT_SECONDS", "30"))
 VECTOR_INDEX_LISTS = int(os.getenv("MEMORY_VECTOR_INDEX_LISTS", "100"))
 VECTOR_PROBES = int(os.getenv("MEMORY_VECTOR_PROBES", "10"))
+REQUIRE_VECTOR = os.getenv("MEMORY_REQUIRE_VECTOR", "false").lower() in ("1", "true", "yes")
+
+VECTOR_DB_ENABLED = False
 
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -123,9 +126,18 @@ def db_conn() -> psycopg.Connection:
 
 
 def init_db() -> None:
+    global VECTOR_DB_ENABLED
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            vector_error: str | None = None
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                VECTOR_DB_ENABLED = True
+            except Exception as ex:
+                VECTOR_DB_ENABLED = False
+                vector_error = str(ex)
+                if REQUIRE_VECTOR:
+                    raise HTTPException(status_code=500, detail=f"pgvector unavailable: {vector_error}")
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS memory_docs (
@@ -138,7 +150,7 @@ def init_db() -> None:
                   source TEXT,
                   created_at TIMESTAMPTZ NOT NULL,
                   updated_at TIMESTAMPTZ NOT NULL,
-                  embedding vector({EMBEDDING_DIM})
+                  embedding_json JSONB
                 )
                 """
             )
@@ -156,10 +168,14 @@ def init_db() -> None:
                   snippet TEXT,
                   created_at TIMESTAMPTZ NOT NULL,
                   updated_at TIMESTAMPTZ NOT NULL,
-                  embedding vector({EMBEDDING_DIM})
+                  embedding_json JSONB
                 )
                 """
             )
+
+            if VECTOR_DB_ENABLED:
+                cur.execute(f"ALTER TABLE memory_docs ADD COLUMN IF NOT EXISTS embedding vector({EMBEDDING_DIM})")
+                cur.execute(f"ALTER TABLE memory_evidence ADD COLUMN IF NOT EXISTS embedding vector({EMBEDDING_DIM})")
 
             cur.execute(
                 """
@@ -168,13 +184,14 @@ def init_db() -> None:
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_tags ON memory_docs USING GIN (tags)")
-            cur.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_memory_docs_embedding
-                ON memory_docs USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = {VECTOR_INDEX_LISTS})
-                """
-            )
+            if VECTOR_DB_ENABLED:
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_memory_docs_embedding
+                    ON memory_docs USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = {VECTOR_INDEX_LISTS})
+                    """
+                )
             cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_memory_evidence_fts
@@ -182,13 +199,14 @@ def init_db() -> None:
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_evidence_tags ON memory_evidence USING GIN (tags)")
-            cur.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_memory_evidence_embedding
-                ON memory_evidence USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = {VECTOR_INDEX_LISTS})
-                """
-            )
+            if VECTOR_DB_ENABLED:
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_memory_evidence_embedding
+                    ON memory_evidence USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = {VECTOR_INDEX_LISTS})
+                    """
+                )
 
 
 def embed_text(text: str) -> list[float] | None:
@@ -222,6 +240,8 @@ def embed_text(text: str) -> list[float] | None:
 
 
 def choose_embedding(explicit: list[float] | None, text_for_embedding: str) -> list[float] | None:
+    if not VECTOR_DB_ENABLED:
+        return None
     if explicit is not None:
         if len(explicit) != EMBEDDING_DIM:
             raise HTTPException(status_code=400, detail=f"embedding length must be {EMBEDDING_DIM}")
@@ -234,38 +254,70 @@ def upsert_doc(doc: MemoryDocIn) -> dict[str, Any]:
     updated_at = parse_iso_or_now(doc.updated_at)
     created_at = utc_now_iso()
     vec = choose_embedding(doc.embedding, f"{doc.title or ''}\n{doc.summary or ''}\n{doc.body}")
-    vec_param = vec_to_pg_literal(vec) if vec is not None else None
+    vec_param = vec_to_pg_literal(vec) if vec is not None and VECTOR_DB_ENABLED else None
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO memory_docs (id, kind, title, body, summary, tags, source, created_at, updated_at, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::vector)
-                ON CONFLICT (id)
-                DO UPDATE SET
-                  kind = EXCLUDED.kind,
-                  title = EXCLUDED.title,
-                  body = EXCLUDED.body,
-                  summary = EXCLUDED.summary,
-                  tags = EXCLUDED.tags,
-                  source = EXCLUDED.source,
-                  updated_at = EXCLUDED.updated_at,
-                  embedding = EXCLUDED.embedding
-                """,
-                (
-                    record_id,
-                    doc.kind,
-                    doc.title,
-                    doc.body,
-                    doc.summary,
-                    json.dumps(doc.tags or {}),
-                    doc.source,
-                    created_at,
-                    updated_at,
-                    vec_param,
-                ),
-            )
+            if VECTOR_DB_ENABLED:
+                cur.execute(
+                    """
+                    INSERT INTO memory_docs (id, kind, title, body, summary, tags, source, created_at, updated_at, embedding, embedding_json)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::vector, %s::jsonb)
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                      kind = EXCLUDED.kind,
+                      title = EXCLUDED.title,
+                      body = EXCLUDED.body,
+                      summary = EXCLUDED.summary,
+                      tags = EXCLUDED.tags,
+                      source = EXCLUDED.source,
+                      updated_at = EXCLUDED.updated_at,
+                      embedding = EXCLUDED.embedding,
+                      embedding_json = EXCLUDED.embedding_json
+                    """,
+                    (
+                        record_id,
+                        doc.kind,
+                        doc.title,
+                        doc.body,
+                        doc.summary,
+                        json.dumps(doc.tags or {}),
+                        doc.source,
+                        created_at,
+                        updated_at,
+                        vec_param,
+                        json.dumps(vec or []),
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO memory_docs (id, kind, title, body, summary, tags, source, created_at, updated_at, embedding_json)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                      kind = EXCLUDED.kind,
+                      title = EXCLUDED.title,
+                      body = EXCLUDED.body,
+                      summary = EXCLUDED.summary,
+                      tags = EXCLUDED.tags,
+                      source = EXCLUDED.source,
+                      updated_at = EXCLUDED.updated_at,
+                      embedding_json = EXCLUDED.embedding_json
+                    """,
+                    (
+                        record_id,
+                        doc.kind,
+                        doc.title,
+                        doc.body,
+                        doc.summary,
+                        json.dumps(doc.tags or {}),
+                        doc.source,
+                        created_at,
+                        updated_at,
+                        json.dumps(vec or []),
+                    ),
+                )
     return {"id": record_id, "kind": doc.kind, "updated_at": updated_at, "embedded": vec is not None}
 
 
@@ -274,42 +326,78 @@ def upsert_evidence(ev: EvidenceIn) -> dict[str, Any]:
     as_of = parse_iso_or_now(ev.as_of) if ev.as_of else None
     now = utc_now_iso()
     vec = choose_embedding(ev.embedding, f"{ev.question}\n{ev.summary}\n{ev.snippet or ''}")
-    vec_param = vec_to_pg_literal(vec) if vec is not None else None
+    vec_param = vec_to_pg_literal(vec) if vec is not None and VECTOR_DB_ENABLED else None
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO memory_evidence (id, question, summary, tool, endpoint, as_of, tags, provenance, snippet, created_at, updated_at, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::vector)
-                ON CONFLICT (id)
-                DO UPDATE SET
-                  question = EXCLUDED.question,
-                  summary = EXCLUDED.summary,
-                  tool = EXCLUDED.tool,
-                  endpoint = EXCLUDED.endpoint,
-                  as_of = EXCLUDED.as_of,
-                  tags = EXCLUDED.tags,
-                  provenance = EXCLUDED.provenance,
-                  snippet = EXCLUDED.snippet,
-                  updated_at = EXCLUDED.updated_at,
-                  embedding = EXCLUDED.embedding
-                """,
-                (
-                    record_id,
-                    ev.question,
-                    ev.summary,
-                    ev.tool,
-                    ev.endpoint,
-                    as_of,
-                    json.dumps(ev.tags or {}),
-                    json.dumps(ev.provenance or {}),
-                    ev.snippet,
-                    now,
-                    now,
-                    vec_param,
-                ),
-            )
+            if VECTOR_DB_ENABLED:
+                cur.execute(
+                    """
+                    INSERT INTO memory_evidence (id, question, summary, tool, endpoint, as_of, tags, provenance, snippet, created_at, updated_at, embedding, embedding_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::vector, %s::jsonb)
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                      question = EXCLUDED.question,
+                      summary = EXCLUDED.summary,
+                      tool = EXCLUDED.tool,
+                      endpoint = EXCLUDED.endpoint,
+                      as_of = EXCLUDED.as_of,
+                      tags = EXCLUDED.tags,
+                      provenance = EXCLUDED.provenance,
+                      snippet = EXCLUDED.snippet,
+                      updated_at = EXCLUDED.updated_at,
+                      embedding = EXCLUDED.embedding,
+                      embedding_json = EXCLUDED.embedding_json
+                    """,
+                    (
+                        record_id,
+                        ev.question,
+                        ev.summary,
+                        ev.tool,
+                        ev.endpoint,
+                        as_of,
+                        json.dumps(ev.tags or {}),
+                        json.dumps(ev.provenance or {}),
+                        ev.snippet,
+                        now,
+                        now,
+                        vec_param,
+                        json.dumps(vec or []),
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO memory_evidence (id, question, summary, tool, endpoint, as_of, tags, provenance, snippet, created_at, updated_at, embedding_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                      question = EXCLUDED.question,
+                      summary = EXCLUDED.summary,
+                      tool = EXCLUDED.tool,
+                      endpoint = EXCLUDED.endpoint,
+                      as_of = EXCLUDED.as_of,
+                      tags = EXCLUDED.tags,
+                      provenance = EXCLUDED.provenance,
+                      snippet = EXCLUDED.snippet,
+                      updated_at = EXCLUDED.updated_at,
+                      embedding_json = EXCLUDED.embedding_json
+                    """,
+                    (
+                        record_id,
+                        ev.question,
+                        ev.summary,
+                        ev.tool,
+                        ev.endpoint,
+                        as_of,
+                        json.dumps(ev.tags or {}),
+                        json.dumps(ev.provenance or {}),
+                        ev.snippet,
+                        now,
+                        now,
+                        json.dumps(vec or []),
+                    ),
+                )
     return {"id": record_id, "as_of": as_of, "embedded": vec is not None}
 
 
@@ -338,7 +426,7 @@ def _search_table(
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-    q_vec_literal = vec_to_pg_literal(q_vec) if q_vec is not None else None
+    q_vec_literal = vec_to_pg_literal(q_vec) if (q_vec is not None and VECTOR_DB_ENABLED) else None
 
     if q_vec_literal is None:
         sql = f"""
@@ -372,7 +460,7 @@ def _search_table(
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            if q_vec_literal is not None:
+            if q_vec_literal is not None and VECTOR_DB_ENABLED:
                 cur.execute("SET LOCAL ivfflat.probes = %s", (VECTOR_PROBES,))
             cur.execute(sql, run_params)
             rows = cur.fetchall()
@@ -467,6 +555,7 @@ def health() -> dict[str, Any]:
         "version": APP_VERSION,
         "embedding_provider": EMBEDDING_PROVIDER,
         "embedding_dim": EMBEDDING_DIM,
+        "vector_db_enabled": VECTOR_DB_ENABLED,
         "has_database_url": bool(DATABASE_URL),
         "docs_count": docs_count,
         "evidence_count": evidence_count,
