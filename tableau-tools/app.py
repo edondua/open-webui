@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_TITLE = "Tableau Tools"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 DATA_DIR = Path(os.getenv("TABLEAU_DATA_DIR", "/app/data"))
 DB_PATH = Path(os.getenv("TABLEAU_DB_PATH", str(DATA_DIR / "tableau.db")))
@@ -149,6 +149,12 @@ class TableauClient:
     def _api(self, path: str) -> str:
         return f"{self.server}/api/{self.api_version}{path}"
 
+    def _headers(self, token: str | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if token:
+            headers["X-Tableau-Auth"] = token
+        return headers
+
     def signin(self) -> tuple[str, str]:
         payload = {
             "credentials": {
@@ -158,10 +164,20 @@ class TableauClient:
             }
         }
         with httpx.Client(timeout=self.timeout) as client:
-            resp = client.post(self._api("/auth/signin"), json=payload)
+            resp = client.post(
+                self._api("/auth/signin"),
+                json=payload,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
         if resp.status_code >= 400:
             raise HTTPException(status_code=502, detail=f"Tableau signin failed {resp.status_code}: {resp.text[:300]}")
 
+        content_type = resp.headers.get("content-type", "")
+        if "application/json" not in content_type:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Tableau signin returned non-JSON response ({content_type})",
+            )
         body = resp.json()
         creds = body.get("credentials", {})
         token = creds.get("token")
@@ -172,7 +188,7 @@ class TableauClient:
 
     def signout(self, token: str) -> None:
         with httpx.Client(timeout=self.timeout) as client:
-            client.post(self._api("/auth/signout"), headers={"X-Tableau-Auth": token})
+            client.post(self._api("/auth/signout"), headers=self._headers(token))
 
     def paged_get(self, token: str, site_id: str, resource: str, max_pages: int) -> list[dict[str, Any]]:
         # Tableau REST resources:
@@ -197,7 +213,7 @@ class TableauClient:
                 url = self._api(f"/sites/{site_id}/{resource}")
                 resp = client.get(
                     url,
-                    headers={"X-Tableau-Auth": token},
+                    headers=self._headers(token),
                     params={"pageSize": page_size, "pageNumber": page_number},
                 )
                 if resp.status_code >= 400:
@@ -206,6 +222,12 @@ class TableauClient:
                         detail=f"Tableau {resource} failed {resp.status_code}: {resp.text[:300]}",
                     )
 
+                content_type = resp.headers.get("content-type", "")
+                if "application/json" not in content_type:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Tableau {resource} returned non-JSON response ({content_type})",
+                    )
                 body = resp.json()
                 container = body.get(resource, {})
                 page_items = container.get(item_key, [])
