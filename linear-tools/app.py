@@ -117,7 +117,7 @@ def _linear_request(query: str, variables: dict[str, Any] | None = None) -> dict
 def _issue_create_payload(issue: IssueCreateRequest, fallback_team_id: str, fallback_project_id: str | None) -> dict[str, Any]:
     team_id = issue.team_id or fallback_team_id
     project_id = issue.project_id if issue.project_id is not None else fallback_project_id
-    return {
+    payload = {
         "title": issue.title,
         "description": issue.description,
         "teamId": team_id,
@@ -129,6 +129,7 @@ def _issue_create_payload(issue: IssueCreateRequest, fallback_team_id: str, fall
         "dueDate": issue.due_date.isoformat() if issue.due_date else None,
         "estimate": issue.estimate,
     }
+    return {k: v for k, v in payload.items() if v is not None}
 
 
 # ── Endpoints ────────────────────────────────────────────────────────
