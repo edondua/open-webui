@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_TITLE = "UXCam Tools"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 DATA_DIR = Path(os.getenv("UXCAM_DATA_DIR", "/app/data"))
 DB_PATH = Path(os.getenv("UXCAM_DB_PATH", str(DATA_DIR / "uxcam.db")))
@@ -23,7 +23,17 @@ DB_PATH = Path(os.getenv("UXCAM_DB_PATH", str(DATA_DIR / "uxcam.db")))
 UXCAM_API_BASE_URL = os.getenv("UXCAM_API_BASE_URL", "").rstrip("/")
 UXCAM_API_KEY = os.getenv("UXCAM_API_KEY", "")
 UXCAM_PROJECT_ID = os.getenv("UXCAM_PROJECT_ID", "")
+UXCAM_APP_ID = os.getenv("UXCAM_APP_ID", "") or UXCAM_PROJECT_ID
 UXCAM_TIMEOUT_SECONDS = int(os.getenv("UXCAM_TIMEOUT_SECONDS", "30"))
+UXCAM_AUTH_MODE = os.getenv("UXCAM_AUTH_MODE", "query").lower()
+UXCAM_APP_ID_PARAM = os.getenv("UXCAM_APP_ID_PARAM", "appid")
+UXCAM_API_KEY_PARAM = os.getenv("UXCAM_API_KEY_PARAM", "apikey")
+UXCAM_PROJECT_HEADER = os.getenv("UXCAM_PROJECT_HEADER", "X-Project-Id")
+UXCAM_INCLUDE_PROJECT_HEADER = os.getenv("UXCAM_INCLUDE_PROJECT_HEADER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # API shape is configurable to avoid hard-coding one UXCam response format.
 UXCAM_ENDPOINT_SESSIONS = os.getenv("UXCAM_ENDPOINT_SESSIONS", "/sessions")
@@ -171,13 +181,27 @@ def extract_next_cursor(resp_json: Any) -> str | None:
 def client_headers() -> dict[str, str]:
     if not UXCAM_API_KEY:
         raise HTTPException(status_code=500, detail="UXCAM_API_KEY is not configured")
-    headers = {
-        "Authorization": f"Bearer {UXCAM_API_KEY}",
-        "Accept": "application/json",
-    }
-    if UXCAM_PROJECT_ID:
-        headers["X-Project-Id"] = UXCAM_PROJECT_ID
+    headers = {"Accept": "application/json"}
+    if UXCAM_AUTH_MODE in ("bearer", "authorization"):
+        headers["Authorization"] = f"Bearer {UXCAM_API_KEY}"
+    elif UXCAM_AUTH_MODE == "token":
+        headers["Authorization"] = f"Token {UXCAM_API_KEY}"
+    if UXCAM_PROJECT_ID and UXCAM_INCLUDE_PROJECT_HEADER:
+        headers[UXCAM_PROJECT_HEADER] = UXCAM_PROJECT_ID
     return headers
+
+
+def auth_query_params() -> dict[str, str]:
+    if UXCAM_AUTH_MODE not in ("query", "query_params"):
+        return {}
+    if not UXCAM_APP_ID:
+        raise HTTPException(status_code=500, detail="UXCAM_APP_ID or UXCAM_PROJECT_ID is not configured")
+    if not UXCAM_API_KEY:
+        raise HTTPException(status_code=500, detail="UXCAM_API_KEY is not configured")
+    return {
+        UXCAM_APP_ID_PARAM: UXCAM_APP_ID,
+        UXCAM_API_KEY_PARAM: UXCAM_API_KEY,
+    }
 
 
 def fetch_paginated(
@@ -196,6 +220,7 @@ def fetch_paginated(
     with httpx.Client(timeout=UXCAM_TIMEOUT_SECONDS) as client:
         for _ in range(max_pages):
             params: dict[str, Any] = {UXCAM_PAGE_SIZE_PARAM: UXCAM_PAGE_SIZE}
+            params.update(auth_query_params())
             if since:
                 params[UXCAM_SINCE_PARAM] = since
             if until:
@@ -312,6 +337,8 @@ def health() -> dict[str, Any]:
         "db_path": str(DB_PATH),
         "has_api_base": bool(UXCAM_API_BASE_URL),
         "has_api_key": bool(UXCAM_API_KEY),
+        "has_app_id": bool(UXCAM_APP_ID),
+        "auth_mode": UXCAM_AUTH_MODE,
     }
 
 
