@@ -38,30 +38,56 @@ def _run_rg(query: str, base: Path, limit: int, word_boundaries: bool = False) -
     if limit < 1:
         return []
     capped_limit = min(limit, MAX_LIMIT)
+    rg_path = shutil.which("rg")
     pattern = rf"\b{re.escape(query)}\b" if word_boundaries else query
-    cmd = [
-        "rg",
-        "-n",
-        "--hidden",
-        "--glob",
-        "!.git",
-        "--glob",
-        "!**/node_modules/**",
-        "--glob",
-        "!**/.next/**",
-        "--glob",
-        "!**/dist/**",
-        "--glob",
-        "!**/build/**",
-        "--glob",
-        "!**/coverage/**",
-        pattern,
-        str(base),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode not in (0, 1):
-        raise HTTPException(status_code=500, detail=result.stderr.strip() or "rg search failed")
-    return result.stdout.splitlines()[:capped_limit]
+
+    if rg_path:
+        cmd = [
+            rg_path,
+            "-n",
+            "--hidden",
+            "--glob",
+            "!.git",
+            "--glob",
+            "!**/node_modules/**",
+            "--glob",
+            "!**/.next/**",
+            "--glob",
+            "!**/dist/**",
+            "--glob",
+            "!**/build/**",
+            "--glob",
+            "!**/coverage/**",
+            pattern,
+            str(base),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode not in (0, 1):
+            raise HTTPException(status_code=500, detail=result.stderr.strip() or "rg search failed")
+        return result.stdout.splitlines()[:capped_limit]
+
+    # Fallback when ripgrep is unavailable in runtime image.
+    results: list[str] = []
+    matcher = re.compile(pattern)
+    skip_dirs = {".git", "node_modules", ".next", "dist", "build", "coverage", "__pycache__"}
+    for path in base.rglob("*"):
+        if len(results) >= capped_limit:
+            break
+        if path.is_dir():
+            continue
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+        rel = _repo_relative(path)
+        for i, line in enumerate(lines, start=1):
+            if matcher.search(line):
+                results.append(f"{rel}:{i}:{line}")
+                if len(results) >= capped_limit:
+                    break
+    return results
 
 
 def _build_clone_url(url: str, token: str) -> str:
