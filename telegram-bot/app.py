@@ -58,8 +58,8 @@ def _is_allowed(user_id: int) -> bool:
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 
-async def _call_openwebui(messages: list[dict]) -> str:
-    """Call Open WebUI chat completions with streaming and automatic retry on 429."""
+async def _stream_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
+    """Call Open WebUI with streaming. Progressively edit a Telegram message so the user sees live output."""
     headers = {
         "Authorization": f"Bearer {OPENWEBUI_API_KEY}",
         "Content-Type": "application/json",
@@ -70,8 +70,14 @@ async def _call_openwebui(messages: list[dict]) -> str:
         "stream": True,
     }
 
+    # Send a placeholder message we'll keep editing
+    placeholder = await bot.send_message(chat_id=chat_id, text="Thinking...")
+
     for attempt in range(MAX_RETRIES):
         full_text = ""
+        last_edit = asyncio.get_event_loop().time()
+        last_edit_text = ""
+
         async with httpx.AsyncClient(timeout=180) as client:
             async with client.stream(
                 "POST",
@@ -82,13 +88,16 @@ async def _call_openwebui(messages: list[dict]) -> str:
                 if resp.status_code == 429:
                     retry_after = int(resp.headers.get("retry-after", 2 ** attempt * 3))
                     log.warning("Rate limited (429), retrying in %ss (attempt %s/%s)", retry_after, attempt + 1, MAX_RETRIES)
+                    await placeholder.edit_text(f"Rate limited, retrying in {retry_after}s...")
                     await asyncio.sleep(retry_after)
                     continue
 
                 if resp.status_code >= 400:
                     body = await resp.aread()
                     log.error("Open WebUI error %s: %s", resp.status_code, body[:500])
-                    return f"Error from AI backend ({resp.status_code}). Please try again."
+                    error_msg = f"Error from AI backend ({resp.status_code}). Please try again."
+                    await placeholder.edit_text(error_msg)
+                    return error_msg
 
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
@@ -105,16 +114,38 @@ async def _call_openwebui(messages: list[dict]) -> str:
                     except (json.JSONDecodeError, IndexError, KeyError):
                         continue
 
-        return full_text.strip() or "No response from the model."
+                    # Progressively update the message every EDIT_INTERVAL seconds
+                    now = asyncio.get_event_loop().time()
+                    preview = full_text[:TELEGRAM_MSG_LIMIT - 3]
+                    if now - last_edit >= EDIT_INTERVAL and preview != last_edit_text:
+                        try:
+                            await placeholder.edit_text(preview + " ...")
+                            last_edit = now
+                            last_edit_text = preview
+                        except Exception:
+                            pass  # Telegram may reject identical edits
 
-    return "The AI backend is busy right now. Please try again in a minute."
+        # Final edit with complete text
+        final = full_text.strip() or "No response from the model."
+        if len(final) <= TELEGRAM_MSG_LIMIT:
+            try:
+                await placeholder.edit_text(final)
+            except Exception:
+                pass
+        else:
+            # For long responses, edit placeholder with first chunk then send the rest
+            try:
+                await placeholder.edit_text(final[:TELEGRAM_MSG_LIMIT])
+            except Exception:
+                pass
+            for i in range(TELEGRAM_MSG_LIMIT, len(final), TELEGRAM_MSG_LIMIT):
+                await bot.send_message(chat_id=chat_id, text=final[i : i + TELEGRAM_MSG_LIMIT])
 
+        return final
 
-async def _send_long(update: Update, text: str) -> None:
-    """Send a message, splitting if it exceeds Telegram's 4096 char limit."""
-    for i in range(0, len(text), TELEGRAM_MSG_LIMIT):
-        chunk = text[i : i + TELEGRAM_MSG_LIMIT]
-        await update.message.reply_text(chunk)
+    error_msg = "The AI backend is busy right now. Please try again in a minute."
+    await placeholder.edit_text(error_msg)
+    return error_msg
 
 
 # ── Telegram Handlers ───────────────────────────────────────────────
@@ -188,21 +219,18 @@ async def handle_message(update: Update, _) -> None:
     if len(histories[user_id]) > MAX_HISTORY:
         histories[user_id] = histories[user_id][-MAX_HISTORY:]
 
-    # Show typing indicator
-    await update.message.chat.send_action("typing")
-
-    # Call Open WebUI
+    # Call Open WebUI with progressive streaming
     try:
-        reply = await _call_openwebui(histories[user_id])
+        reply = await _stream_openwebui(
+            histories[user_id], update.message.chat_id, tg_app.bot
+        )
     except Exception as e:
         log.exception("Error calling Open WebUI")
         reply = f"Error: {e}"
+        await update.message.reply_text(reply)
 
     # Add assistant reply to history
     histories[user_id].append({"role": "assistant", "content": reply})
-
-    # Send response
-    await _send_long(update, reply)
 
 
 # ── App Lifecycle ───────────────────────────────────────────────────
