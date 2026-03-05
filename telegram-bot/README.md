@@ -27,6 +27,7 @@ Note: API keys must be enabled by admin under **Admin -> Settings -> General -> 
 | `OPENWEBUI_API_URL` | Yes | e.g. `https://your-openwebui.up.railway.app` |
 | `OPENWEBUI_API_KEY` | Yes | Open WebUI API key (`sk-...`) |
 | `OPENWEBUI_MODEL` | Yes | Model ID (e.g. `gpt-4o`, `claude-sonnet-4-20250514`) |
+| `OPENWEBUI_TOOL_IDS` | Yes (for tool use) | Comma-separated tool IDs enabled for this bot (e.g. `server:linear,server:uxcam,server:tableau,server:code-tools,server:memory-tools`) |
 | `WEBHOOK_URL` | No | Public URL of this service (for webhook mode) |
 | `ALLOWED_TELEGRAM_USERS` | No | Comma-separated Telegram user IDs |
 | `MAX_HISTORY` | No | Max messages per user (default: 50) |
@@ -38,6 +39,7 @@ export TELEGRAM_BOT_TOKEN="your-token"
 export OPENWEBUI_API_URL="https://your-openwebui.up.railway.app"
 export OPENWEBUI_API_KEY="sk-your-key"
 export OPENWEBUI_MODEL="gpt-4o"
+export OPENWEBUI_TOOL_IDS="server:linear,server:uxcam,server:tableau,server:code-tools,server:memory-tools"
 
 cd telegram-bot
 ./run.sh

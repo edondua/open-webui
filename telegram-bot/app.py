@@ -21,6 +21,10 @@ OPENWEBUI_API_KEY = os.getenv("OPENWEBUI_API_KEY", "")
 OPENWEBUI_MODEL = os.getenv("OPENWEBUI_MODEL", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "50"))
+OPENWEBUI_TOOL_IDS_RAW = os.getenv("OPENWEBUI_TOOL_IDS", "")
+OPENWEBUI_TOOL_IDS = [
+    tid.strip() for tid in OPENWEBUI_TOOL_IDS_RAW.split(",") if tid.strip()
+]
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_TELEGRAM_USERS", "")
 ALLOWED_USERS: set[int] = set()
 if ALLOWED_USERS_RAW.strip():
@@ -139,6 +143,8 @@ async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
             "messages": full_messages,
             "stream": False,
         }
+        if OPENWEBUI_TOOL_IDS:
+            payload["tool_ids"] = OPENWEBUI_TOOL_IDS
 
         for attempt in range(MAX_RETRIES):
             timeout_config = httpx.Timeout(
@@ -376,6 +382,13 @@ async def startup() -> None:
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await tg_app.initialize()
+
+    if OPENWEBUI_TOOL_IDS:
+        log.info("Open WebUI tool_ids configured: %s", ", ".join(OPENWEBUI_TOOL_IDS))
+    else:
+        log.warning(
+            "OPENWEBUI_TOOL_IDS is empty. The model may not have access to tool servers (Linear, UXCam, Tableau, etc.)."
+        )
 
     if WEBHOOK_URL:
         webhook_path = f"{WEBHOOK_URL}/webhook"
