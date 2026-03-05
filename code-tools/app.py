@@ -22,7 +22,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 MAX_LIMIT = 300
 
 SKIP_DIRS = {".git", "node_modules", ".next", "dist", "build", "coverage", "__pycache__", "vendor"}
-SOURCE_EXTENSIONS = {
+CODE_EXTENSIONS = {
     ".ts",
     ".tsx",
     ".js",
@@ -44,9 +44,6 @@ SOURCE_EXTENSIONS = {
     ".mm",
     ".sql",
     ".graphql",
-    ".yaml",
-    ".yml",
-    ".json",
 }
 CALL_KEYWORDS = {
     "if",
@@ -95,7 +92,7 @@ def _file_allowed(path: Path, source_only: bool, extensions: set[str] | None, ex
     rel = _repo_relative(path).lower()
     if exclude_docs and rel.startswith("docs/"):
         return False
-    if source_only and path.suffix.lower() not in SOURCE_EXTENSIONS:
+    if source_only and path.suffix.lower() not in CODE_EXTENSIONS:
         return False
     if extensions and path.suffix.lower() not in extensions:
         return False
@@ -146,7 +143,7 @@ def _run_rg(
         if exclude_docs:
             cmd += ["--glob", "!docs/**"]
         if source_only:
-            for ext in sorted(SOURCE_EXTENSIONS):
+            for ext in sorted(CODE_EXTENSIONS):
                 cmd += ["--glob", f"**/*{ext}"]
         if extensions:
             for ext in sorted(extensions):
@@ -341,6 +338,21 @@ def _find_symbol_definitions(symbol: str, base: Path, limit: int = 20) -> list[d
             found.append({"symbol": symbol, "file": file_path, "line": line_no, "snippet": content.strip()})
             if len(found) >= limit:
                 return found
+    if not found:
+        # Fallback to symbol references when definition patterns are not explicit.
+        refs = _run_rg(symbol, base, limit=limit, word_boundaries=True, source_only=True, exclude_docs=True)
+        for line in refs:
+            parsed = _parse_search_line(line)
+            if not parsed:
+                continue
+            file_path, line_no, content = parsed
+            key = (file_path, line_no)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"symbol": symbol, "file": file_path, "line": line_no, "snippet": content.strip()})
+            if len(found) >= limit:
+                break
     return found
 
 

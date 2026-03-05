@@ -54,6 +54,7 @@ Use your Railway URL in Open WebUI:
 - If repo path does not exist, server will clone from `REPO_URL` on first request.
 - Requests are path-sandboxed to that repository.
 - `search_code` defaults to `source_only=true` and `exclude_docs=true` for better code-focused retrieval.
+- `source_only=true` now targets code extensions (ts/js/py/go/swift/etc.) and skips config-heavy files by default.
 - If `git` or `rg` is unavailable in runtime, the service falls back to built-in Python download/search logic.
 
 ## Prompt Pattern (Recommended)
