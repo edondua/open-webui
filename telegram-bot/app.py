@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections import defaultdict
 
 import httpx
@@ -28,6 +29,7 @@ if ALLOWED_USERS_RAW.strip():
 TELEGRAM_MSG_LIMIT = 4096
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "600"))  # 10 min for tool-heavy calls
+MAX_TOOL_NUDGES = int(os.getenv("MAX_TOOL_NUDGES", "2"))
 
 # System prompt injected into every conversation so the AI gives
 # direct, high-quality answers instead of filler/planning text.
@@ -72,6 +74,47 @@ def _is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USERS
 
 
+def _extract_content(data: dict) -> str:
+    """Extract response content from OpenAI-compatible payloads."""
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # Some backends return a structured array of content blocks.
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content or "")
+
+
+_DEFERRAL_PATTERNS = (
+    r"\bi('?| wi)ll (check|fetch|look|review|analy[sz]e)\b",
+    r"\blet me (check|fetch|look|review)\b",
+    r"\bfirst[, ]+(getting|checking|fetching)\b",
+    r"\bchecking (the|for)\b",
+)
+
+DEFERRAL_FAILURE_MSG = (
+    "I could not complete tool execution for this request, so I don't have reliable final numbers yet. "
+    "Please retry in a moment."
+)
+
+
+def _looks_like_deferral(text: str) -> bool:
+    lowered = text.lower()
+    return any(re.search(pattern, lowered) for pattern in _DEFERRAL_PATTERNS)
+
+
 # ── Call Open WebUI (non-streaming for reliability) ──────────────────
 
 async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
@@ -86,72 +129,89 @@ async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
         "Content-Type": "application/json",
     }
 
-    # Prepend system prompt
-    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-
-    payload = {
-        "model": OPENWEBUI_MODEL,
-        "messages": full_messages,
-        "stream": False,
-    }
-
     placeholder = await bot.send_message(chat_id=chat_id, text="Working on it...")
 
-    for attempt in range(MAX_RETRIES):
-        timeout_config = httpx.Timeout(
-            connect=30.0,
-            read=REQUEST_TIMEOUT,
-            write=30.0,
-            pool=30.0,
-        )
+    convo_messages = list(messages)
+    for nudge_round in range(MAX_TOOL_NUDGES + 1):
+        full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + convo_messages
+        payload = {
+            "model": OPENWEBUI_MODEL,
+            "messages": full_messages,
+            "stream": False,
+        }
 
-        try:
-            async with httpx.AsyncClient(timeout=timeout_config) as client:
-                resp = await client.post(
-                    f"{OPENWEBUI_API_URL}/api/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
+        for attempt in range(MAX_RETRIES):
+            timeout_config = httpx.Timeout(
+                connect=30.0,
+                read=REQUEST_TIMEOUT,
+                write=30.0,
+                pool=30.0,
+            )
 
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("retry-after", 2 ** attempt * 3))
-                log.warning("Rate limited (429), attempt %s/%s", attempt + 1, MAX_RETRIES)
-                await _safe_edit(placeholder, f"Rate limited, retrying in {retry_after}s...")
-                await asyncio.sleep(retry_after)
-                continue
+            try:
+                async with httpx.AsyncClient(timeout=timeout_config) as client:
+                    resp = await client.post(
+                        f"{OPENWEBUI_API_URL}/api/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
 
-            if resp.status_code >= 400:
-                log.error("Open WebUI error %s: %s", resp.status_code, resp.text[:500])
-                error_msg = f"Error from AI backend ({resp.status_code}). Please try again."
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("retry-after", 2 ** attempt * 3))
+                    log.warning("Rate limited (429), attempt %s/%s", attempt + 1, MAX_RETRIES)
+                    await _safe_edit(placeholder, f"Rate limited, retrying in {retry_after}s...")
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                if resp.status_code >= 400:
+                    log.error("Open WebUI error %s: %s", resp.status_code, resp.text[:500])
+                    error_msg = f"Error from AI backend ({resp.status_code}). Please try again."
+                    await _safe_edit(placeholder, error_msg)
+                    return error_msg
+
+                data = resp.json()
+                final = _extract_content(data).strip() or "No response from the model."
+
+                if _looks_like_deferral(final):
+                    if nudge_round < MAX_TOOL_NUDGES:
+                        log.warning("Model returned deferral text, applying nudge %s", nudge_round + 1)
+                        await _safe_edit(placeholder, "Fetching actual data and final answer...")
+                        convo_messages.extend([
+                            {"role": "assistant", "content": final},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Do the required tool calls now and return the final results in this "
+                                    "message with concrete numbers. Do not say you will check later."
+                                ),
+                            },
+                        ])
+                        break
+                    log.error("Model still returned deferral after %s nudges", MAX_TOOL_NUDGES)
+                    await _safe_edit(placeholder, DEFERRAL_FAILURE_MSG)
+                    return DEFERRAL_FAILURE_MSG
+
+                # Send the complete answer
+                await _send_final(placeholder, final, chat_id, bot)
+                return final
+
+            except httpx.ReadTimeout:
+                log.error("Request timeout after %ss", REQUEST_TIMEOUT)
+                error_msg = "The AI is taking too long (tools may be slow). Please try again or /clear."
                 await _safe_edit(placeholder, error_msg)
                 return error_msg
-
-            data = resp.json()
-            content = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            final = content.strip() or "No response from the model."
-
-            # Send the complete answer
-            await _send_final(placeholder, final, chat_id, bot)
-            return final
-
-        except httpx.ReadTimeout:
-            log.error("Request timeout after %ss", REQUEST_TIMEOUT)
-            error_msg = "The AI is taking too long (tools may be slow). Please try again or /clear."
-            await _safe_edit(placeholder, error_msg)
-            return error_msg
-        except Exception as e:
-            log.exception("Error calling Open WebUI: %s", e)
-            if attempt < MAX_RETRIES - 1:
-                await _safe_edit(placeholder, f"Error, retrying ({attempt + 1}/{MAX_RETRIES})...")
-                await asyncio.sleep(2)
-                continue
-            error_msg = f"Connection error: {type(e).__name__}. Please try again."
-            await _safe_edit(placeholder, error_msg)
-            return error_msg
+            except Exception as e:
+                log.exception("Error calling Open WebUI: %s", e)
+                if attempt < MAX_RETRIES - 1:
+                    await _safe_edit(placeholder, f"Error, retrying ({attempt + 1}/{MAX_RETRIES})...")
+                    await asyncio.sleep(2)
+                    continue
+                error_msg = f"Connection error: {type(e).__name__}. Please try again."
+                await _safe_edit(placeholder, error_msg)
+                return error_msg
+        else:
+            continue
+        continue
 
     error_msg = "The AI backend is busy. Please try again in a minute."
     await _safe_edit(placeholder, error_msg)
