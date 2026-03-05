@@ -55,6 +55,7 @@ class SyncViewDataRequest(BaseModel):
     view_query: str | None = Field(default=None, description="case-insensitive view name contains")
     max_views: int = Field(default=10, ge=1, le=200)
     max_rows_per_view: int = Field(default=500, ge=1, le=10000)
+    metadata_max_pages: int = Field(default=10, ge=1, le=200)
 
 
 def utc_now_iso() -> str:
@@ -488,12 +489,11 @@ def sync_run(req: SyncRequest) -> dict[str, Any]:
 @app.post("/sync/view-data")
 def sync_view_data(req: SyncViewDataRequest) -> dict[str, Any]:
     init_db()
+    # Refresh metadata first so new workbooks/views added in Tableau are included.
+    run_sync("workbooks", req.metadata_max_pages)
+    run_sync("views", req.metadata_max_pages)
+
     candidates = select_views_for_data_sync(req.workbook_query, req.view_query, req.max_views)
-    if not candidates:
-        # Try to refresh view/workbook metadata once if cache is empty or too narrow.
-        run_sync("workbooks", 2)
-        run_sync("views", 4)
-        candidates = select_views_for_data_sync(req.workbook_query, req.view_query, req.max_views)
     if not candidates:
         return {"synced_views": 0, "items": [], "note": "No matching views found"}
 
