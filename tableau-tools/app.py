@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import sqlite3
@@ -26,6 +28,7 @@ TABLEAU_PAT_VALUE = os.getenv("TABLEAU_PAT_VALUE") or os.getenv("TABLEAU_PAT_SEC
 TABLEAU_API_VERSION = os.getenv("TABLEAU_API_VERSION", "3.24")
 TABLEAU_TIMEOUT_SECONDS = int(os.getenv("TABLEAU_TIMEOUT_SECONDS", "40"))
 TABLEAU_PAGE_SIZE = int(os.getenv("TABLEAU_PAGE_SIZE", "100"))
+TABLEAU_VIEW_DATA_MAX_ROWS = int(os.getenv("TABLEAU_VIEW_DATA_MAX_ROWS", "500"))
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 app.add_middleware(
@@ -45,6 +48,13 @@ class SyncRequest(BaseModel):
 class ResyncRequest(BaseModel):
     resource: str = Field(default="all")
     max_pages: int = Field(default=50, ge=1, le=300)
+
+
+class SyncViewDataRequest(BaseModel):
+    workbook_query: str | None = Field(default=None, description="case-insensitive workbook name contains")
+    view_query: str | None = Field(default=None, description="case-insensitive view name contains")
+    max_views: int = Field(default=10, ge=1, le=200)
+    max_rows_per_view: int = Field(default=500, ge=1, le=10000)
 
 
 def utc_now_iso() -> str:
@@ -108,10 +118,23 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS view_data_cache (
+                view_id TEXT PRIMARY KEY,
+                workbook_id TEXT,
+                workbook_name TEXT,
+                view_name TEXT,
+                row_count INTEGER NOT NULL,
+                columns_json TEXT NOT NULL,
+                rows_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_workbooks_name ON workbooks_raw(name);
             CREATE INDEX IF NOT EXISTS idx_views_name ON views_raw(name);
             CREATE INDEX IF NOT EXISTS idx_datasources_name ON datasources_raw(name);
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs_raw(status);
+            CREATE INDEX IF NOT EXISTS idx_view_data_workbook_name ON view_data_cache(workbook_name);
+            CREATE INDEX IF NOT EXISTS idx_view_data_view_name ON view_data_cache(view_name);
             """
         )
 
@@ -247,6 +270,26 @@ class TableauClient:
 
         return items
 
+    def fetch_view_data(self, token: str, site_id: str, view_id: str) -> dict[str, Any]:
+        url = self._api(f"/sites/{site_id}/views/{view_id}/data")
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get(url, headers={"X-Tableau-Auth": token, "Accept": "text/csv"})
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Tableau view data failed {resp.status_code}: {resp.text[:300]}")
+
+        content = resp.text
+        if not content.strip():
+            return {"columns": [], "rows": []}
+
+        reader = csv.DictReader(io.StringIO(content))
+        rows: list[dict[str, Any]] = []
+        for i, row in enumerate(reader):
+            if i >= TABLEAU_VIEW_DATA_MAX_ROWS:
+                break
+            rows.append({k: v for k, v in row.items()})
+        cols = list(reader.fieldnames or [])
+        return {"columns": cols, "rows": rows}
+
 
 def upsert_workbooks(items: list[dict[str, Any]]) -> int:
     now = utc_now_iso()
@@ -343,6 +386,69 @@ def run_sync(resource: str, max_pages: int) -> dict[str, Any]:
         client.signout(token)
 
 
+def select_views_for_data_sync(workbook_query: str | None, view_query: str | None, limit: int) -> list[dict[str, Any]]:
+    sql = """
+    SELECT
+      v.tableau_id AS view_id,
+      v.workbook_id AS workbook_id,
+      v.name AS view_name,
+      w.name AS workbook_name
+    FROM views_raw v
+    LEFT JOIN workbooks_raw w ON v.workbook_id = w.tableau_id
+    """
+    wh = []
+    params: list[Any] = []
+    if workbook_query:
+        wh.append("lower(coalesce(w.name,'')) LIKE ?")
+        params.append(f"%{workbook_query.lower()}%")
+    if view_query:
+        wh.append("lower(coalesce(v.name,'')) LIKE ?")
+        params.append(f"%{view_query.lower()}%")
+    if wh:
+        sql += " WHERE " + " AND ".join(wh)
+    sql += " ORDER BY w.name, v.name LIMIT ?"
+    params.append(limit)
+    with db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_view_data_cache(
+    view_id: str,
+    workbook_id: str | None,
+    workbook_name: str | None,
+    view_name: str | None,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO view_data_cache(view_id, workbook_id, workbook_name, view_name, row_count, columns_json, rows_json, fetched_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(view_id)
+            DO UPDATE SET
+              workbook_id=excluded.workbook_id,
+              workbook_name=excluded.workbook_name,
+              view_name=excluded.view_name,
+              row_count=excluded.row_count,
+              columns_json=excluded.columns_json,
+              rows_json=excluded.rows_json,
+              fetched_at=excluded.fetched_at
+            """,
+            (
+                view_id,
+                workbook_id,
+                workbook_name,
+                view_name,
+                len(rows),
+                json.dumps(columns),
+                json.dumps(rows),
+                utc_now_iso(),
+            ),
+        )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
@@ -377,6 +483,51 @@ def sync_run(req: SyncRequest) -> dict[str, Any]:
     return run_sync(resource, req.max_pages)
 
 
+@app.post("/sync/view-data")
+def sync_view_data(req: SyncViewDataRequest) -> dict[str, Any]:
+    init_db()
+    candidates = select_views_for_data_sync(req.workbook_query, req.view_query, req.max_views)
+    if not candidates:
+        # Try to refresh view/workbook metadata once if cache is empty or too narrow.
+        run_sync("workbooks", 2)
+        run_sync("views", 4)
+        candidates = select_views_for_data_sync(req.workbook_query, req.view_query, req.max_views)
+    if not candidates:
+        return {"synced_views": 0, "items": [], "note": "No matching views found"}
+
+    client = TableauClient()
+    token, site_id = client.signin()
+    synced: list[dict[str, Any]] = []
+    try:
+        for v in candidates:
+            view_id = str(v["view_id"])
+            payload = client.fetch_view_data(token, site_id, view_id)
+            rows = payload["rows"][: req.max_rows_per_view]
+            columns = payload["columns"]
+            upsert_view_data_cache(
+                view_id=view_id,
+                workbook_id=v.get("workbook_id"),
+                workbook_name=v.get("workbook_name"),
+                view_name=v.get("view_name"),
+                columns=columns,
+                rows=rows,
+            )
+            synced.append(
+                {
+                    "view_id": view_id,
+                    "workbook_name": v.get("workbook_name"),
+                    "view_name": v.get("view_name"),
+                    "row_count": len(rows),
+                    "columns_count": len(columns),
+                }
+            )
+    finally:
+        client.signout(token)
+
+    set_state("view_data:last_sync_at", utc_now_iso())
+    return {"synced_views": len(synced), "items": synced}
+
+
 @app.post("/sync/resync")
 def sync_resync(req: ResyncRequest) -> dict[str, Any]:
     init_db()
@@ -407,6 +558,7 @@ def sync_status() -> dict[str, Any]:
             "views": conn.execute("SELECT COUNT(*) c FROM views_raw").fetchone()["c"],
             "datasources": conn.execute("SELECT COUNT(*) c FROM datasources_raw").fetchone()["c"],
             "jobs": conn.execute("SELECT COUNT(*) c FROM jobs_raw").fetchone()["c"],
+            "view_data_cache": conn.execute("SELECT COUNT(*) c FROM view_data_cache").fetchone()["c"],
         }
     return {"counts": counts, "state": get_state_rows()}
 
@@ -486,4 +638,36 @@ def data_jobs(limit: int = Query(default=100, ge=1, le=2000), status: str | None
     items = [dict(r) for r in rows]
     for item in items:
         item["payload"] = json.loads(item["payload"])
+    return {"count": len(items), "items": items}
+
+
+@app.get("/data/view-data")
+def data_view_data(
+    limit: int = Query(default=50, ge=1, le=500),
+    workbook_query: str | None = None,
+    view_query: str | None = None,
+) -> dict[str, Any]:
+    sql = """
+    SELECT view_id, workbook_id, workbook_name, view_name, row_count, columns_json, rows_json, fetched_at
+    FROM view_data_cache
+    """
+    wh = []
+    params: list[Any] = []
+    if workbook_query:
+        wh.append("lower(coalesce(workbook_name,'')) LIKE ?")
+        params.append(f"%{workbook_query.lower()}%")
+    if view_query:
+        wh.append("lower(coalesce(view_name,'')) LIKE ?")
+        params.append(f"%{view_query.lower()}%")
+    if wh:
+        sql += " WHERE " + " AND ".join(wh)
+    sql += " ORDER BY fetched_at DESC LIMIT ?"
+    params.append(limit)
+
+    with db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    items = [dict(r) for r in rows]
+    for item in items:
+        item["columns"] = json.loads(item.pop("columns_json"))
+        item["rows"] = json.loads(item.pop("rows_json"))
     return {"count": len(items), "items": items}
