@@ -14,11 +14,52 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 APP_TITLE = "Dua Code Tools"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 REPO_ROOT = Path(os.getenv("REPO_ROOT", "/workspace/dua-codebase")).resolve()
 REPO_URL = os.getenv("REPO_URL", "").strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
-MAX_LIMIT = 200
+MAX_LIMIT = 300
+
+SKIP_DIRS = {".git", "node_modules", ".next", "dist", "build", "coverage", "__pycache__", "vendor"}
+SOURCE_EXTENSIONS = {
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".py",
+    ".go",
+    ".java",
+    ".kt",
+    ".swift",
+    ".rb",
+    ".rs",
+    ".php",
+    ".cs",
+    ".cpp",
+    ".c",
+    ".h",
+    ".hpp",
+    ".m",
+    ".mm",
+    ".sql",
+    ".graphql",
+    ".yaml",
+    ".yml",
+    ".json",
+}
+CALL_KEYWORDS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "return",
+    "await",
+    "new",
+    "typeof",
+    "print",
+    "console",
+}
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -34,7 +75,48 @@ def _safe_path(rel: str) -> Path:
     return base
 
 
-def _run_rg(query: str, base: Path, limit: int, word_boundaries: bool = False) -> list[str]:
+def _normalize_extensions(extensions: list[str] | None) -> set[str] | None:
+    if not extensions:
+        return None
+    normalized = set()
+    for ext in extensions:
+        val = ext.strip().lower()
+        if not val:
+            continue
+        normalized.add(val if val.startswith(".") else f".{val}")
+    return normalized or None
+
+
+def _file_allowed(path: Path, source_only: bool, extensions: set[str] | None, exclude_docs: bool) -> bool:
+    if any(part in SKIP_DIRS for part in path.parts):
+        return False
+    rel = _repo_relative(path).lower()
+    if exclude_docs and rel.startswith("docs/"):
+        return False
+    if source_only and path.suffix.lower() not in SOURCE_EXTENSIONS:
+        return False
+    if extensions and path.suffix.lower() not in extensions:
+        return False
+    return True
+
+
+def _iter_repo_files(base: Path, source_only: bool, extensions: set[str] | None, exclude_docs: bool):
+    for path in base.rglob("*"):
+        if not path.is_file():
+            continue
+        if _file_allowed(path, source_only=source_only, extensions=extensions, exclude_docs=exclude_docs):
+            yield path
+
+
+def _run_rg(
+    query: str,
+    base: Path,
+    limit: int,
+    word_boundaries: bool = False,
+    source_only: bool = False,
+    extensions: set[str] | None = None,
+    exclude_docs: bool = False,
+) -> list[str]:
     if limit < 1:
         return []
     capped_limit = min(limit, MAX_LIMIT)
@@ -58,29 +140,30 @@ def _run_rg(query: str, base: Path, limit: int, word_boundaries: bool = False) -
             "!**/build/**",
             "--glob",
             "!**/coverage/**",
-            pattern,
-            str(base),
         ]
+        if exclude_docs:
+            cmd += ["--glob", "!docs/**"]
+        if source_only:
+            for ext in sorted(SOURCE_EXTENSIONS):
+                cmd += ["--glob", f"**/*{ext}"]
+        if extensions:
+            for ext in sorted(extensions):
+                cmd += ["--glob", f"**/*{ext}"]
+        cmd += [pattern, str(base)]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode not in (0, 1):
                 raise HTTPException(status_code=500, detail=result.stderr.strip() or "rg search failed")
             return result.stdout.splitlines()[:capped_limit]
         except FileNotFoundError:
-            # Some runtimes resolve rg path but fail at exec-time; continue to pure Python fallback.
             pass
 
     # Fallback when ripgrep is unavailable in runtime image.
     results: list[str] = []
     matcher = re.compile(pattern)
-    skip_dirs = {".git", "node_modules", ".next", "dist", "build", "coverage", "__pycache__"}
-    for path in base.rglob("*"):
+    for path in _iter_repo_files(base, source_only=source_only, extensions=extensions, exclude_docs=exclude_docs):
         if len(results) >= capped_limit:
             break
-        if path.is_dir():
-            continue
-        if any(part in skip_dirs for part in path.parts):
-            continue
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
@@ -98,7 +181,7 @@ def _build_clone_url(url: str, token: str) -> str:
     if not token:
         return url
     if url.startswith("https://"):
-        return f"https://{token}@{url[len('https://'):]}"
+        return f"https://{token}@{url[len('https://'):] }"
     return url
 
 
@@ -123,6 +206,7 @@ def _download_and_extract_github_repo(repo_url: str, token: str, target: Path) -
             status_code=500,
             detail="git is unavailable and REPO_URL is not a supported GitHub repo URL.",
         )
+
     headers = {"User-Agent": "dua-code-tools"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -166,6 +250,7 @@ def _ensure_repo() -> None:
         return
     if not REPO_URL:
         raise HTTPException(status_code=500, detail=f"Repository not found and REPO_URL is unset: {REPO_ROOT}")
+
     REPO_ROOT.parent.mkdir(parents=True, exist_ok=True)
     git_path = shutil.which("git")
     if git_path:
@@ -186,9 +271,12 @@ def _ensure_repo() -> None:
 
 
 class SearchCodeRequest(BaseModel):
-    query: str = Field(min_length=1, description="ripgrep pattern or text to search for")
+    query: str = Field(min_length=1, description="Text/pattern to search")
     path: str = Field(default=".", description="relative path under repository root")
     limit: int = Field(default=50, ge=1, le=MAX_LIMIT)
+    source_only: bool = Field(default=True, description="Prefer source code files over docs/assets")
+    exclude_docs: bool = Field(default=True, description="Exclude docs/ folder")
+    extensions: list[str] | None = Field(default=None, description="Optional file extensions filter")
 
 
 class ReadFileRequest(BaseModel):
@@ -197,10 +285,79 @@ class ReadFileRequest(BaseModel):
     end: int = Field(default=200, ge=1, description="end line, 1-based")
 
 
+class ListFilesRequest(BaseModel):
+    path: str = Field(default=".", description="relative path under repository root")
+    limit: int = Field(default=200, ge=1, le=2000)
+    source_only: bool = Field(default=True)
+    exclude_docs: bool = Field(default=True)
+    extensions: list[str] | None = Field(default=None)
+    name_pattern: str | None = Field(default=None, description="substring to match in file path")
+
+
+class TraceCallPathRequest(BaseModel):
+    symbol: str = Field(min_length=1)
+    path: str = Field(default=".")
+    max_depth: int = Field(default=2, ge=1, le=5)
+    max_edges: int = Field(default=40, ge=1, le=200)
+
+
+def _parse_search_line(line: str) -> tuple[str, int, str] | None:
+    parts = line.split(":", 2)
+    if len(parts) != 3:
+        return None
+    file_path, line_no, content = parts
+    try:
+        num = int(line_no)
+    except ValueError:
+        return None
+    return file_path, num, content
+
+
+def _find_symbol_definitions(symbol: str, base: Path, limit: int = 20) -> list[dict[str, object]]:
+    patterns = [
+        rf"\bfunction\s+{re.escape(symbol)}\b",
+        rf"\bdef\s+{re.escape(symbol)}\b",
+        rf"\bclass\s+{re.escape(symbol)}\b",
+        rf"\bconst\s+{re.escape(symbol)}\s*=",
+        rf"\blet\s+{re.escape(symbol)}\s*=",
+        rf"\bvar\s+{re.escape(symbol)}\s*=",
+        rf"\b{re.escape(symbol)}\s*:\s*(?:async\s*)?\(",
+    ]
+    found: list[dict[str, object]] = []
+    seen = set()
+    for pat in patterns:
+        matches = _run_rg(pat, base, limit=limit, source_only=True, exclude_docs=True)
+        for line in matches:
+            parsed = _parse_search_line(line)
+            if not parsed:
+                continue
+            file_path, line_no, content = parsed
+            key = (file_path, line_no)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"symbol": symbol, "file": file_path, "line": line_no, "snippet": content.strip()})
+            if len(found) >= limit:
+                return found
+    return found
+
+
+def _extract_called_symbols(source_chunk: str) -> list[str]:
+    symbols = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", source_chunk)
+    unique = []
+    seen = set()
+    for s in symbols:
+        if s in CALL_KEYWORDS or s in seen or len(s) < 2:
+            continue
+        seen.add(s)
+        unique.append(s)
+    return unique
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     _ensure_repo()
-    return {"ok": True, "repo_root": str(REPO_ROOT)}
+    return {"ok": True, "repo_root": str(REPO_ROOT), "version": APP_VERSION}
 
 
 @app.get("/list_services")
@@ -216,14 +373,57 @@ def list_services() -> dict[str, object]:
     return {"repo_root": str(REPO_ROOT), "services": services}
 
 
+@app.post("/list_files")
+def list_files(req: ListFilesRequest) -> dict[str, object]:
+    _ensure_repo()
+    base = _safe_path(req.path)
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(status_code=404, detail=f"Directory not found: {req.path}")
+
+    extensions = _normalize_extensions(req.extensions)
+    files = []
+    name_pattern = req.name_pattern.lower() if req.name_pattern else None
+    for path in _iter_repo_files(base, source_only=req.source_only, extensions=extensions, exclude_docs=req.exclude_docs):
+        rel = _repo_relative(path)
+        if name_pattern and name_pattern not in rel.lower():
+            continue
+        files.append(rel)
+        if len(files) >= req.limit:
+            break
+
+    return {
+        "path": req.path,
+        "count": len(files),
+        "source_only": req.source_only,
+        "exclude_docs": req.exclude_docs,
+        "files": files,
+    }
+
+
 @app.post("/search_code")
 def search_code(req: SearchCodeRequest) -> dict[str, object]:
     _ensure_repo()
     base = _safe_path(req.path)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail=f"Directory not found: {req.path}")
-    results = _run_rg(req.query, base, req.limit, word_boundaries=False)
-    return {"query": req.query, "path": req.path, "count": len(results), "results": results}
+    extensions = _normalize_extensions(req.extensions)
+    results = _run_rg(
+        req.query,
+        base,
+        req.limit,
+        word_boundaries=False,
+        source_only=req.source_only,
+        extensions=extensions,
+        exclude_docs=req.exclude_docs,
+    )
+    return {
+        "query": req.query,
+        "path": req.path,
+        "count": len(results),
+        "source_only": req.source_only,
+        "exclude_docs": req.exclude_docs,
+        "results": results,
+    }
 
 
 @app.post("/read_file")
@@ -248,14 +448,104 @@ def read_file(req: ReadFileRequest) -> dict[str, object]:
 
 
 @app.get("/find_references")
-def find_references(symbol: str, path: str = ".", limit: int = 100) -> dict[str, object]:
+def find_references(
+    symbol: str,
+    path: str = ".",
+    limit: int = 100,
+    source_only: bool = True,
+    exclude_docs: bool = True,
+) -> dict[str, object]:
     _ensure_repo()
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
     if limit < 1 or limit > MAX_LIMIT:
         raise HTTPException(status_code=400, detail=f"limit must be between 1 and {MAX_LIMIT}")
+
     base = _safe_path(path)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail=f"Directory not found: {path}")
-    results = _run_rg(symbol, base, limit, word_boundaries=True)
-    return {"symbol": symbol, "path": path, "count": len(results), "results": results}
+
+    results = _run_rg(
+        symbol,
+        base,
+        limit,
+        word_boundaries=True,
+        source_only=source_only,
+        exclude_docs=exclude_docs,
+    )
+    return {
+        "symbol": symbol,
+        "path": path,
+        "count": len(results),
+        "source_only": source_only,
+        "exclude_docs": exclude_docs,
+        "results": results,
+    }
+
+
+@app.post("/trace_call_path")
+def trace_call_path(req: TraceCallPathRequest) -> dict[str, object]:
+    _ensure_repo()
+    base = _safe_path(req.path)
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(status_code=404, detail=f"Directory not found: {req.path}")
+
+    entry_defs = _find_symbol_definitions(req.symbol, base, limit=10)
+    queue = [req.symbol]
+    visited_symbols = {req.symbol}
+    nodes: dict[str, list[dict[str, object]]] = {req.symbol: entry_defs}
+    edges: list[dict[str, object]] = []
+
+    depth = 0
+    while queue and depth < req.max_depth and len(edges) < req.max_edges:
+        current = queue.pop(0)
+        defs = nodes.get(current, [])
+        if not defs:
+            continue
+
+        for d in defs[:3]:
+            file_rel = d["file"]
+            line_no = int(d["line"])
+            file_abs = _safe_path(file_rel)
+            try:
+                lines = file_abs.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            start = max(0, line_no - 1)
+            end = min(len(lines), line_no + 60)
+            chunk = "\n".join(lines[start:end])
+            called = _extract_called_symbols(chunk)
+
+            for callee in called:
+                callee_defs = _find_symbol_definitions(callee, base, limit=2)
+                to_ref = callee_defs[0] if callee_defs else None
+                edges.append(
+                    {
+                        "from_symbol": current,
+                        "from_file": file_rel,
+                        "from_line": line_no,
+                        "to_symbol": callee,
+                        "to_file": to_ref["file"] if to_ref else None,
+                        "to_line": to_ref["line"] if to_ref else None,
+                    }
+                )
+                if len(edges) >= req.max_edges:
+                    break
+                if callee not in visited_symbols and callee_defs:
+                    visited_symbols.add(callee)
+                    queue.append(callee)
+                    nodes[callee] = callee_defs
+            if len(edges) >= req.max_edges:
+                break
+        depth += 1
+
+    return {
+        "entry_symbol": req.symbol,
+        "path": req.path,
+        "definitions": entry_defs,
+        "depth_traversed": depth,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "nodes": nodes,
+        "edges": edges,
+    }
