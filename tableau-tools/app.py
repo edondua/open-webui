@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_TITLE = "Tableau Tools"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 DATA_DIR = Path(os.getenv("TABLEAU_DATA_DIR", "/app/data"))
 DB_PATH = Path(os.getenv("TABLEAU_DB_PATH", str(DATA_DIR / "tableau.db")))
@@ -273,7 +273,9 @@ class TableauClient:
     def fetch_view_data(self, token: str, site_id: str, view_id: str) -> dict[str, Any]:
         url = self._api(f"/sites/{site_id}/views/{view_id}/data")
         with httpx.Client(timeout=self.timeout) as client:
-            resp = client.get(url, headers={"X-Tableau-Auth": token, "Accept": "text/csv"})
+            # Tableau Cloud can return 406 when Accept is explicitly text/csv.
+            # Reuse default headers and parse CSV from response body.
+            resp = client.get(url, headers=self._headers(token))
         if resp.status_code >= 400:
             raise HTTPException(status_code=502, detail=f"Tableau view data failed {resp.status_code}: {resp.text[:300]}")
 
