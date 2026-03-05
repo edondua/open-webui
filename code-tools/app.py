@@ -61,10 +61,14 @@ def _run_rg(query: str, base: Path, limit: int, word_boundaries: bool = False) -
             pattern,
             str(base),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode not in (0, 1):
-            raise HTTPException(status_code=500, detail=result.stderr.strip() or "rg search failed")
-        return result.stdout.splitlines()[:capped_limit]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode not in (0, 1):
+                raise HTTPException(status_code=500, detail=result.stderr.strip() or "rg search failed")
+            return result.stdout.splitlines()[:capped_limit]
+        except FileNotFoundError:
+            # Some runtimes resolve rg path but fail at exec-time; continue to pure Python fallback.
+            pass
 
     # Fallback when ripgrep is unavailable in runtime image.
     results: list[str] = []
