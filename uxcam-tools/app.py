@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_TITLE = "UXCam Tools"
@@ -36,6 +37,13 @@ UXCAM_PAGE_SIZE_PARAM = os.getenv("UXCAM_PAGE_SIZE_PARAM", "page_size")
 UXCAM_PAGE_SIZE = int(os.getenv("UXCAM_PAGE_SIZE", "200"))
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class SyncRequest(BaseModel):

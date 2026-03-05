@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_TITLE = "Tableau Tools"
@@ -27,6 +28,13 @@ TABLEAU_TIMEOUT_SECONDS = int(os.getenv("TABLEAU_TIMEOUT_SECONDS", "40"))
 TABLEAU_PAGE_SIZE = int(os.getenv("TABLEAU_PAGE_SIZE", "100"))
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class SyncRequest(BaseModel):
