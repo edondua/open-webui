@@ -500,34 +500,45 @@ def sync_view_data(req: SyncViewDataRequest) -> dict[str, Any]:
     client = TableauClient()
     token, site_id = client.signin()
     synced: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
     try:
         for v in candidates:
             view_id = str(v["view_id"])
-            payload = client.fetch_view_data(token, site_id, view_id)
-            rows = payload["rows"][: req.max_rows_per_view]
-            columns = payload["columns"]
-            upsert_view_data_cache(
-                view_id=view_id,
-                workbook_id=v.get("workbook_id"),
-                workbook_name=v.get("workbook_name"),
-                view_name=v.get("view_name"),
-                columns=columns,
-                rows=rows,
-            )
-            synced.append(
-                {
-                    "view_id": view_id,
-                    "workbook_name": v.get("workbook_name"),
-                    "view_name": v.get("view_name"),
-                    "row_count": len(rows),
-                    "columns_count": len(columns),
-                }
-            )
+            try:
+                payload = client.fetch_view_data(token, site_id, view_id)
+                rows = payload["rows"][: req.max_rows_per_view]
+                columns = payload["columns"]
+                upsert_view_data_cache(
+                    view_id=view_id,
+                    workbook_id=v.get("workbook_id"),
+                    workbook_name=v.get("workbook_name"),
+                    view_name=v.get("view_name"),
+                    columns=columns,
+                    rows=rows,
+                )
+                synced.append(
+                    {
+                        "view_id": view_id,
+                        "workbook_name": v.get("workbook_name"),
+                        "view_name": v.get("view_name"),
+                        "row_count": len(rows),
+                        "columns_count": len(columns),
+                    }
+                )
+            except HTTPException as ex:
+                failed.append(
+                    {
+                        "view_id": view_id,
+                        "workbook_name": v.get("workbook_name"),
+                        "view_name": v.get("view_name"),
+                        "error": ex.detail,
+                    }
+                )
     finally:
         client.signout(token)
 
     set_state("view_data:last_sync_at", utc_now_iso())
-    return {"synced_views": len(synced), "items": synced}
+    return {"synced_views": len(synced), "failed_views": len(failed), "items": synced, "failed": failed}
 
 
 @app.post("/sync/resync")
