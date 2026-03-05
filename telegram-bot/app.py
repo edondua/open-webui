@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 
 import httpx
@@ -27,13 +28,17 @@ if ALLOWED_USERS_RAW.strip():
     ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(",") if uid.strip()}
 
 EDIT_INTERVAL = 1.5  # seconds between progressive message edits
+KEEPALIVE_INTERVAL = 8.0  # seconds between "still working" edits when no new tokens
 TELEGRAM_MSG_LIMIT = 4096
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+STREAM_TIMEOUT = int(os.getenv("STREAM_TIMEOUT", "600"))  # 10 min for tool-heavy calls
 
 # ── State ───────────────────────────────────────────────────────────
 histories: dict[int, list[dict]] = defaultdict(list)
+_processing: set[int] = set()  # user IDs currently being processed
 
 # ── FastAPI (webhook receiver) ──────────────────────────────────────
-web = FastAPI(title="Telegram Bot", version="1.0.0")
+web = FastAPI(title="Telegram Bot", version="1.1.0")
 tg_app: Application | None = None
 
 
@@ -55,11 +60,14 @@ def _is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USERS
 
 
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-
+# ── Streaming call to Open WebUI ────────────────────────────────────
 
 async def _stream_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
-    """Call Open WebUI with streaming. Progressively edit a Telegram message so the user sees live output."""
+    """Call Open WebUI with streaming. Progressively edit a Telegram message.
+
+    Handles long tool-use responses by showing keepalive updates so the user
+    knows the bot is still working even when no new tokens are arriving.
+    """
     headers = {
         "Authorization": f"Bearer {OPENWEBUI_API_KEY}",
         "Content-Type": "application/json",
@@ -70,85 +78,157 @@ async def _stream_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str
         "stream": True,
     }
 
-    # Send a placeholder message we'll keep editing
     placeholder = await bot.send_message(chat_id=chat_id, text="Thinking...")
 
     for attempt in range(MAX_RETRIES):
         full_text = ""
         last_edit = asyncio.get_event_loop().time()
         last_edit_text = ""
+        last_token_time = asyncio.get_event_loop().time()
+        keepalive_dots = 0
 
-        async with httpx.AsyncClient(timeout=180) as client:
-            async with client.stream(
-                "POST",
-                f"{OPENWEBUI_API_URL}/api/chat/completions",
-                headers=headers,
-                json=payload,
-            ) as resp:
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("retry-after", 2 ** attempt * 3))
-                    log.warning("Rate limited (429), retrying in %ss (attempt %s/%s)", retry_after, attempt + 1, MAX_RETRIES)
-                    await placeholder.edit_text(f"Rate limited, retrying in {retry_after}s...")
-                    await asyncio.sleep(retry_after)
-                    continue
+        timeout_config = httpx.Timeout(
+            connect=30.0,
+            read=STREAM_TIMEOUT,  # long read timeout for tool calls
+            write=30.0,
+            pool=30.0,
+        )
 
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    log.error("Open WebUI error %s: %s", resp.status_code, body[:500])
-                    error_msg = f"Error from AI backend ({resp.status_code}). Please try again."
-                    await placeholder.edit_text(error_msg)
-                    return error_msg
-
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            full_text += content
-                    except (json.JSONDecodeError, IndexError, KeyError):
+        try:
+            async with httpx.AsyncClient(timeout=timeout_config) as client:
+                async with client.stream(
+                    "POST",
+                    f"{OPENWEBUI_API_URL}/api/chat/completions",
+                    headers=headers,
+                    json=payload,
+                ) as resp:
+                    if resp.status_code == 429:
+                        retry_after = int(resp.headers.get("retry-after", 2 ** attempt * 3))
+                        log.warning("Rate limited (429), retrying in %ss (attempt %s/%s)", retry_after, attempt + 1, MAX_RETRIES)
+                        await _safe_edit(placeholder, f"Rate limited, retrying in {retry_after}s...")
+                        await asyncio.sleep(retry_after)
                         continue
 
-                    # Progressively update the message every EDIT_INTERVAL seconds
-                    now = asyncio.get_event_loop().time()
-                    preview = full_text[:TELEGRAM_MSG_LIMIT - 3]
-                    if now - last_edit >= EDIT_INTERVAL and preview != last_edit_text:
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        log.error("Open WebUI error %s: %s", resp.status_code, body[:500])
+                        error_msg = f"Error from AI backend ({resp.status_code}). Please try again."
+                        await _safe_edit(placeholder, error_msg)
+                        return error_msg
+
+                    # Use aiter_lines with a keepalive wrapper so we can
+                    # update the placeholder even when the AI is using tools
+                    # and no tokens are streaming yet.
+                    async for line in _iter_lines_with_keepalive(
+                        resp, placeholder, full_text, last_edit, last_edit_text
+                    ):
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
                         try:
-                            await placeholder.edit_text(preview + " ...")
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                full_text += content
+                                last_token_time = asyncio.get_event_loop().time()
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            continue
+
+                        # Progressively update the message
+                        now = asyncio.get_event_loop().time()
+                        preview = full_text[:TELEGRAM_MSG_LIMIT - 4]
+                        if now - last_edit >= EDIT_INTERVAL and preview != last_edit_text:
+                            await _safe_edit(placeholder, preview + " ...")
                             last_edit = now
                             last_edit_text = preview
-                        except Exception:
-                            pass  # Telegram may reject identical edits
+
+        except httpx.ReadTimeout:
+            log.error("Stream read timeout after %ss", STREAM_TIMEOUT)
+            if full_text.strip():
+                # We got partial content — use it
+                break
+            error_msg = "The AI is taking too long. Please try a simpler question or /clear and retry."
+            await _safe_edit(placeholder, error_msg)
+            return error_msg
+        except Exception as e:
+            log.exception("Stream error: %s", e)
+            if full_text.strip():
+                break
+            error_msg = f"Connection error: {type(e).__name__}. Please try again."
+            await _safe_edit(placeholder, error_msg)
+            return error_msg
 
         # Final edit with complete text
         final = full_text.strip() or "No response from the model."
-        if len(final) <= TELEGRAM_MSG_LIMIT:
-            try:
-                await placeholder.edit_text(final)
-            except Exception:
-                pass
-        else:
-            # For long responses, edit placeholder with first chunk then send the rest
-            try:
-                await placeholder.edit_text(final[:TELEGRAM_MSG_LIMIT])
-            except Exception:
-                pass
-            for i in range(TELEGRAM_MSG_LIMIT, len(final), TELEGRAM_MSG_LIMIT):
-                await bot.send_message(chat_id=chat_id, text=final[i : i + TELEGRAM_MSG_LIMIT])
-
+        await _send_final(placeholder, final, chat_id, bot)
         return final
 
     error_msg = "The AI backend is busy right now. Please try again in a minute."
-    await placeholder.edit_text(error_msg)
+    await _safe_edit(placeholder, error_msg)
     return error_msg
 
 
+async def _iter_lines_with_keepalive(resp, placeholder, full_text_ref, last_edit_ref, last_edit_text_ref):
+    """Wrap aiter_lines and periodically update placeholder during long pauses.
+
+    When the AI is calling tools (code search, Linear, etc.), there can be
+    long gaps with no SSE data. This sends keepalive edits so the user knows
+    the bot is still working.
+    """
+    phases = ["Thinking", "Researching", "Analyzing", "Processing"]
+    phase_idx = 0
+    last_keepalive = asyncio.get_event_loop().time()
+
+    buffer = b""
+    async for raw_bytes in resp.aiter_bytes():
+        buffer += raw_bytes
+        # Check for keepalive update
+        now = asyncio.get_event_loop().time()
+        if now - last_keepalive >= KEEPALIVE_INTERVAL:
+            phase_label = phases[phase_idx % len(phases)]
+            dots = "." * ((phase_idx // len(phases)) % 4 + 1)
+            try:
+                await placeholder.edit_text(f"{phase_label}{dots}")
+            except Exception:
+                pass
+            last_keepalive = now
+            phase_idx += 1
+
+        # Yield complete lines
+        while b"\n" in buffer:
+            line_bytes, buffer = buffer.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            if line:
+                yield line
+
+    # Yield remaining
+    if buffer.strip():
+        yield buffer.decode("utf-8", errors="replace").strip()
+
+
+async def _safe_edit(message, text: str) -> None:
+    """Edit message text, silently ignoring Telegram errors."""
+    try:
+        await message.edit_text(text[:TELEGRAM_MSG_LIMIT])
+    except Exception:
+        pass
+
+
+async def _send_final(placeholder, final: str, chat_id: int, bot: Bot) -> None:
+    """Send the final complete response, splitting if needed."""
+    if len(final) <= TELEGRAM_MSG_LIMIT:
+        await _safe_edit(placeholder, final)
+    else:
+        await _safe_edit(placeholder, final[:TELEGRAM_MSG_LIMIT])
+        for i in range(TELEGRAM_MSG_LIMIT, len(final), TELEGRAM_MSG_LIMIT):
+            await bot.send_message(chat_id=chat_id, text=final[i : i + TELEGRAM_MSG_LIMIT])
+
+
 # ── Telegram Handlers ───────────────────────────────────────────────
+
 async def cmd_start(update: Update, _) -> None:
     user_id = update.effective_user.id
     if not _is_allowed(user_id):
@@ -168,6 +248,7 @@ async def cmd_clear(update: Update, _) -> None:
     if not _is_allowed(user_id):
         return
     histories[user_id] = []
+    _processing.discard(user_id)
     await update.message.reply_text("Conversation history cleared.")
 
 
@@ -186,15 +267,35 @@ async def cmd_status(update: Update, _) -> None:
                 headers={"Authorization": f"Bearer {OPENWEBUI_API_KEY}"},
             )
         if resp.status_code == 200:
+            processing = "yes (working on it)" if user_id in _processing else "no"
             await update.message.reply_text(
                 f"Connected to Open WebUI\n"
                 f"Model: {OPENWEBUI_MODEL}\n"
-                f"History: {len(histories[user_id])} messages"
+                f"History: {len(histories[user_id])} messages\n"
+                f"Processing: {processing}"
             )
         else:
             await update.message.reply_text(f"Open WebUI returned status {resp.status_code}")
     except Exception as e:
         await update.message.reply_text(f"Cannot reach Open WebUI: {e}")
+
+
+async def _process_message(user_id: int, chat_id: int, bot: Bot, messages: list[dict]) -> None:
+    """Background task: call Open WebUI and update history."""
+    try:
+        _processing.add(user_id)
+        reply = await _stream_openwebui(messages, chat_id, bot)
+    except Exception as e:
+        log.exception("Error calling Open WebUI")
+        reply = f"Error: {e}"
+        try:
+            await bot.send_message(chat_id=chat_id, text=reply)
+        except Exception:
+            pass
+    finally:
+        _processing.discard(user_id)
+
+    histories[user_id].append({"role": "assistant", "content": reply})
 
 
 async def handle_message(update: Update, _) -> None:
@@ -212,6 +313,13 @@ async def handle_message(update: Update, _) -> None:
     if not user_text:
         return
 
+    # If already processing a message for this user, queue acknowledgement
+    if user_id in _processing:
+        await update.message.reply_text(
+            "I'm still working on your previous request. Please wait for it to finish, or /clear to cancel."
+        )
+        return
+
     # Add user message to history
     histories[user_id].append({"role": "user", "content": user_text})
 
@@ -219,18 +327,10 @@ async def handle_message(update: Update, _) -> None:
     if len(histories[user_id]) > MAX_HISTORY:
         histories[user_id] = histories[user_id][-MAX_HISTORY:]
 
-    # Call Open WebUI with progressive streaming
-    try:
-        reply = await _stream_openwebui(
-            histories[user_id], update.message.chat_id, tg_app.bot
-        )
-    except Exception as e:
-        log.exception("Error calling Open WebUI")
-        reply = f"Error: {e}"
-        await update.message.reply_text(reply)
-
-    # Add assistant reply to history
-    histories[user_id].append({"role": "assistant", "content": reply})
+    # Process in background so webhook returns immediately
+    asyncio.create_task(
+        _process_message(user_id, update.message.chat_id, tg_app.bot, list(histories[user_id]))
+    )
 
 
 # ── App Lifecycle ───────────────────────────────────────────────────
@@ -256,7 +356,6 @@ async def startup() -> None:
         await tg_app.bot.set_webhook(url=webhook_path)
         log.info("Webhook set: %s", webhook_path)
     else:
-        # Long-polling mode for local dev
         await tg_app.start()
         await tg_app.updater.start_polling(drop_pending_updates=True)
         log.info("Bot started in polling mode")
@@ -273,6 +372,7 @@ async def shutdown() -> None:
 
 @web.post("/webhook")
 async def telegram_webhook(request: Request) -> dict:
+    """Receive Telegram updates. Returns immediately; processing happens in background."""
     if not tg_app:
         return {"ok": False, "error": "Bot not initialized"}
     data = await request.json()
@@ -290,4 +390,5 @@ async def health() -> dict:
         "model": OPENWEBUI_MODEL,
         "webhook_mode": bool(WEBHOOK_URL),
         "allowed_users": len(ALLOWED_USERS) if ALLOWED_USERS else "all",
+        "active_tasks": len(_processing),
     }
