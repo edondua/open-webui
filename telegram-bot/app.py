@@ -280,8 +280,25 @@ async def cmd_status(update: Update, _) -> None:
         await update.message.reply_text(f"Cannot reach Open WebUI: {e}")
 
 
+async def _typing_loop(chat_id: int, bot: Bot, stop_event: asyncio.Event) -> None:
+    """Send 'typing...' indicator every 4s until stop_event is set."""
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            break  # event was set
+        except asyncio.TimeoutError:
+            pass  # send another typing action
+
+
 async def _process_message(user_id: int, chat_id: int, bot: Bot, messages: list[dict]) -> None:
     """Background task: call Open WebUI and update history."""
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(chat_id, bot, stop_typing))
+
     try:
         _processing.add(user_id)
         reply = await _stream_openwebui(messages, chat_id, bot)
@@ -293,6 +310,8 @@ async def _process_message(user_id: int, chat_id: int, bot: Bot, messages: list[
         except Exception:
             pass
     finally:
+        stop_typing.set()
+        typing_task.cancel()
         _processing.discard(user_id)
 
     histories[user_id].append({"role": "assistant", "content": reply})
