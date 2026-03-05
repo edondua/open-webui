@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -62,6 +63,7 @@ CALL_KEYWORDS = {
 }
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+REPO_BOOTSTRAP_LOCK = threading.Lock()
 
 
 def _repo_relative(path: Path) -> str:
@@ -223,10 +225,7 @@ def _download_and_extract_github_repo(repo_url: str, token: str, target: Path) -
         finally:
             tmp.flush()
 
-    extract_dir = target_parent / f".extract-{target.name}"
-    if extract_dir.exists():
-        shutil.rmtree(extract_dir)
-    extract_dir.mkdir(parents=True, exist_ok=True)
+    extract_dir = Path(tempfile.mkdtemp(prefix=f"extract-{target.name}-", dir=str(target_parent)))
 
     try:
         with tarfile.open(tmp_path, "r:gz") as tar:
@@ -248,26 +247,29 @@ def _download_and_extract_github_repo(repo_url: str, token: str, target: Path) -
 def _ensure_repo() -> None:
     if REPO_ROOT.exists():
         return
-    if not REPO_URL:
-        raise HTTPException(status_code=500, detail=f"Repository not found and REPO_URL is unset: {REPO_ROOT}")
+    with REPO_BOOTSTRAP_LOCK:
+        if REPO_ROOT.exists():
+            return
+        if not REPO_URL:
+            raise HTTPException(status_code=500, detail=f"Repository not found and REPO_URL is unset: {REPO_ROOT}")
 
-    REPO_ROOT.parent.mkdir(parents=True, exist_ok=True)
-    git_path = shutil.which("git")
-    if git_path:
-        clone_url = _build_clone_url(REPO_URL, GITHUB_TOKEN)
-        clone = subprocess.run(
-            [git_path, "clone", "--depth", "1", clone_url, str(REPO_ROOT)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if clone.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=clone.stderr.strip() or "Failed to clone repository. Verify REPO_URL/GITHUB_TOKEN.",
+        REPO_ROOT.parent.mkdir(parents=True, exist_ok=True)
+        git_path = shutil.which("git")
+        if git_path:
+            clone_url = _build_clone_url(REPO_URL, GITHUB_TOKEN)
+            clone = subprocess.run(
+                [git_path, "clone", "--depth", "1", clone_url, str(REPO_ROOT)],
+                capture_output=True,
+                text=True,
+                check=False,
             )
-    else:
-        _download_and_extract_github_repo(REPO_URL, GITHUB_TOKEN, REPO_ROOT)
+            if clone.returncode != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail=clone.stderr.strip() or "Failed to clone repository. Verify REPO_URL/GITHUB_TOKEN.",
+                )
+        else:
+            _download_and_extract_github_repo(REPO_URL, GITHUB_TOKEN, REPO_ROOT)
 
 
 class SearchCodeRequest(BaseModel):
