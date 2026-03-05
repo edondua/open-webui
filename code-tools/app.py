@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -67,24 +72,87 @@ def _build_clone_url(url: str, token: str) -> str:
     return url
 
 
+def _github_tarball_url(repo_url: str) -> str:
+    parsed = urlparse(repo_url)
+    if parsed.netloc != "github.com":
+        return ""
+    path = parsed.path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2:
+        return ""
+    owner, repo = parts
+    return f"https://api.github.com/repos/{owner}/{repo}/tarball"
+
+
+def _download_and_extract_github_repo(repo_url: str, token: str, target: Path) -> None:
+    tarball_url = _github_tarball_url(repo_url)
+    if not tarball_url:
+        raise HTTPException(
+            status_code=500,
+            detail="git is unavailable and REPO_URL is not a supported GitHub repo URL.",
+        )
+    headers = {"User-Agent": "dua-code-tools"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = Request(tarball_url, headers=headers)
+    target_parent = target.parent
+    target_parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        try:
+            with urlopen(req, timeout=60) as resp:
+                tmp.write(resp.read())
+        finally:
+            tmp.flush()
+
+    extract_dir = target_parent / f".extract-{target.name}"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tarfile.open(tmp_path, "r:gz") as tar:
+            tar.extractall(path=extract_dir)
+        extracted_dirs = [p for p in extract_dir.iterdir() if p.is_dir()]
+        if not extracted_dirs:
+            raise HTTPException(status_code=500, detail="Failed to extract repository archive.")
+        extracted_root = extracted_dirs[0]
+        if target.exists():
+            shutil.rmtree(target)
+        extracted_root.rename(target)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
+
 def _ensure_repo() -> None:
     if REPO_ROOT.exists():
         return
     if not REPO_URL:
         raise HTTPException(status_code=500, detail=f"Repository not found and REPO_URL is unset: {REPO_ROOT}")
     REPO_ROOT.parent.mkdir(parents=True, exist_ok=True)
-    clone_url = _build_clone_url(REPO_URL, GITHUB_TOKEN)
-    clone = subprocess.run(
-        ["git", "clone", "--depth", "1", clone_url, str(REPO_ROOT)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if clone.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=clone.stderr.strip() or "Failed to clone repository. Verify REPO_URL/GITHUB_TOKEN.",
+    git_path = shutil.which("git")
+    if git_path:
+        clone_url = _build_clone_url(REPO_URL, GITHUB_TOKEN)
+        clone = subprocess.run(
+            [git_path, "clone", "--depth", "1", clone_url, str(REPO_ROOT)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        if clone.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=clone.stderr.strip() or "Failed to clone repository. Verify REPO_URL/GITHUB_TOKEN.",
+            )
+    else:
+        _download_and_extract_github_repo(REPO_URL, GITHUB_TOKEN, REPO_ROOT)
 
 
 class SearchCodeRequest(BaseModel):
