@@ -113,11 +113,39 @@ DEFERRAL_FAILURE_MSG = (
     "I could not complete tool execution for this request, so I don't have reliable final numbers yet. "
     "Please retry in a moment."
 )
+LINEAR_TASK_FAILURE_MSG = (
+    "I could not finish creating Linear tasks in this run. "
+    "No confirmed issue IDs/URLs were returned. Please retry."
+)
 
 
 def _looks_like_deferral(text: str) -> bool:
     lowered = text.lower()
     return any(re.search(pattern, lowered) for pattern in _DEFERRAL_PATTERNS)
+
+
+def _has_linear_task_artifacts(text: str) -> bool:
+    """Check if the response contains concrete Linear issue output."""
+    if re.search(r"https://linear\.app/[^\s)]+", text):
+        return True
+    if re.search(r"\b[A-Z]{2,10}-\d+\b", text):
+        return True
+    return False
+
+
+def _looks_like_incomplete_linear_task_reply(text: str) -> bool:
+    lowered = text.lower()
+    soft_progress_markers = (
+        "proceeding to create",
+        "calling linear tools",
+        "one moment",
+        "i'll create",
+        "i will create",
+        "creating ",
+    )
+    if any(marker in lowered for marker in soft_progress_markers):
+        return not _has_linear_task_artifacts(text)
+    return False
 
 
 def _is_linear_task_request(messages: list[dict]) -> bool:
@@ -192,6 +220,8 @@ async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
         }
         if OPENWEBUI_TOOL_IDS:
             payload["tool_ids"] = OPENWEBUI_TOOL_IDS
+        if linear_task_mode:
+            payload["tool_choice"] = "required"
 
         for attempt in range(MAX_RETRIES):
             timeout_config = httpx.Timeout(
@@ -224,6 +254,28 @@ async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
 
                 data = resp.json()
                 final = _extract_content(data).strip() or "No response from the model."
+
+                if linear_task_mode and _looks_like_incomplete_linear_task_reply(final):
+                    if nudge_round < MAX_TOOL_NUDGES:
+                        log.warning(
+                            "Linear task reply incomplete (no issue artifacts), applying nudge %s",
+                            nudge_round + 1,
+                        )
+                        await _safe_edit(placeholder, "Completing Linear task creation and collecting issue links...")
+                        convo_messages.extend([
+                            {"role": "assistant", "content": final},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Do the Linear tool calls now and finish in this same reply. "
+                                    "Return created issue identifiers and URLs only."
+                                ),
+                            },
+                        ])
+                        break
+                    log.error("Linear task reply incomplete after %s nudges", MAX_TOOL_NUDGES)
+                    await _safe_edit(placeholder, LINEAR_TASK_FAILURE_MSG)
+                    return LINEAR_TASK_FAILURE_MSG
 
                 if _looks_like_deferral(final):
                     if nudge_round < MAX_TOOL_NUDGES:
