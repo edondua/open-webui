@@ -115,6 +115,11 @@ _DEFERRAL_PATTERNS = (
     r"\blet me (check|fetch|look|review)\b",
     r"\bfirst[, ]+(getting|checking|fetching)\b",
     r"\bchecking (the|for)\b",
+    r"\bi('?| wi)ll (follow up|get back|update you)\b",
+    r"\b(i|we)('?| wi)ll share .* (shortly|soon|later)\b",
+    r"\bone moment\b",
+    r"\bcalling .* tools now\b",
+    r"\bproceeding to\b",
 )
 
 DEFERRAL_FAILURE_MSG = (
