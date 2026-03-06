@@ -26,6 +26,14 @@ OPENWEBUI_TOOL_IDS = [
     tid.strip() for tid in OPENWEBUI_TOOL_IDS_RAW.split(",") if tid.strip()
 ]
 LINEAR_DEFAULT_TEAM_ID = os.getenv("LINEAR_DEFAULT_TEAM_ID", "").strip()
+LINEAR_TOOLS_URL = os.getenv("LINEAR_TOOLS_URL", "https://linear-tools-production.up.railway.app").rstrip("/")
+LINEAR_TOOLS_API_KEY = os.getenv("LINEAR_TOOLS_API_KEY", "").strip()
+LINEAR_TASK_FALLBACK_ENABLED = os.getenv("LINEAR_TASK_FALLBACK_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_TELEGRAM_USERS", "")
 ALLOWED_USERS: set[int] = set()
 if ALLOWED_USERS_RAW.strip():
@@ -146,6 +154,67 @@ def _looks_like_incomplete_linear_task_reply(text: str) -> bool:
     if any(marker in lowered for marker in soft_progress_markers):
         return not _has_linear_task_artifacts(text)
     return False
+
+
+async def _direct_linear_task_fallback(context_text: str, desired_count: int = 3) -> str | None:
+    """Create demo tasks directly via linear-tools service when model tool use stalls."""
+    if not LINEAR_TASK_FALLBACK_ENABLED or not LINEAR_TOOLS_API_KEY:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {LINEAR_TOOLS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=30.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            team_resp = await client.get(f"{LINEAR_TOOLS_URL}/v1/linear/teams", headers=headers)
+            if team_resp.status_code >= 400:
+                return None
+            teams = team_resp.json().get("teams", [])
+            if not teams:
+                return None
+
+            selected_team = next((t for t in teams if t.get("id") == LINEAR_DEFAULT_TEAM_ID), teams[0])
+            team_id = selected_team.get("id")
+            team_name = selected_team.get("name", "unknown")
+            if not team_id:
+                return None
+
+            context_snippet = context_text.strip().replace("\n", " ")
+            if len(context_snippet) > 140:
+                context_snippet = context_snippet[:140] + "..."
+
+            issues: list[dict] = []
+            for i in range(1, max(1, desired_count) + 1):
+                payload = {
+                    "title": f"Demo Task {i}",
+                    "description": f"Auto-created from Telegram context: {context_snippet}",
+                    "team_id": team_id,
+                    "priority": 3,
+                }
+                create_resp = await client.post(
+                    f"{LINEAR_TOOLS_URL}/v1/linear/issues",
+                    headers=headers,
+                    json=payload,
+                )
+                if create_resp.status_code >= 400:
+                    continue
+                body = create_resp.json()
+                issue = body.get("issue") or {}
+                if issue.get("identifier") and issue.get("url"):
+                    issues.append(issue)
+
+            if not issues:
+                return None
+
+            lines = [f"Created {len(issues)} Linear tasks in {team_name}:"]
+            for issue in issues:
+                lines.append(f"- {issue['identifier']}: {issue['url']}")
+            return "\n".join(lines)
+    except Exception:
+        return None
 
 
 def _is_linear_task_request(messages: list[dict]) -> bool:
@@ -274,6 +343,15 @@ async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
                         ])
                         break
                     log.error("Linear task reply incomplete after %s nudges", MAX_TOOL_NUDGES)
+                    fallback_context = ""
+                    for msg in reversed(convo_messages):
+                        if msg.get("role") == "user":
+                            fallback_context = msg.get("content", "")
+                            break
+                    direct_result = await _direct_linear_task_fallback(fallback_context, desired_count=3)
+                    if direct_result:
+                        await _send_final(placeholder, direct_result, chat_id, bot)
+                        return direct_result
                     await _safe_edit(placeholder, LINEAR_TASK_FAILURE_MSG)
                     return LINEAR_TASK_FAILURE_MSG
 

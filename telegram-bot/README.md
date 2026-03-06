@@ -29,6 +29,9 @@ Note: API keys must be enabled by admin under **Admin -> Settings -> General -> 
 | `OPENWEBUI_MODEL` | Yes | Model ID (e.g. `gpt-4o`, `claude-sonnet-4-20250514`) |
 | `OPENWEBUI_TOOL_IDS` | Yes (for tool use) | Comma-separated tool IDs enabled for this bot (e.g. `server:linear,server:uxcam,server:tableau,server:code-tools,server:memory-tools`) |
 | `LINEAR_DEFAULT_TEAM_ID` | No | Default team UUID for Linear task creation requests from context |
+| `LINEAR_TOOLS_URL` | No | Linear tools service base URL for deterministic fallback (default: `https://linear-tools-production.up.railway.app`) |
+| `LINEAR_TOOLS_API_KEY` | No | Bearer token for `LINEAR_TOOLS_URL` fallback execution |
+| `LINEAR_TASK_FALLBACK_ENABLED` | No | Enable direct fallback task creation when model stalls (`true` by default) |
 | `WEBHOOK_URL` | No | Public URL of this service (for webhook mode) |
 | `ALLOWED_TELEGRAM_USERS` | No | Comma-separated Telegram user IDs |
 | `MAX_HISTORY` | No | Max messages per user (default: 50) |
