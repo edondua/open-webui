@@ -25,6 +25,7 @@ OPENWEBUI_TOOL_IDS_RAW = os.getenv("OPENWEBUI_TOOL_IDS", "")
 OPENWEBUI_TOOL_IDS = [
     tid.strip() for tid in OPENWEBUI_TOOL_IDS_RAW.split(",") if tid.strip()
 ]
+LINEAR_DEFAULT_TEAM_ID = os.getenv("LINEAR_DEFAULT_TEAM_ID", "").strip()
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_TELEGRAM_USERS", "")
 ALLOWED_USERS: set[int] = set()
 if ALLOWED_USERS_RAW.strip():
@@ -119,6 +120,47 @@ def _looks_like_deferral(text: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in _DEFERRAL_PATTERNS)
 
 
+def _is_linear_task_request(messages: list[dict]) -> bool:
+    """Detect user intent to create Linear tasks/issues from context."""
+    latest_user = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            latest_user = (msg.get("content") or "").lower()
+            break
+    if not latest_user:
+        return False
+    has_linear = "linear" in latest_user
+    has_task_intent = any(
+        keyword in latest_user
+        for keyword in (
+            "create task",
+            "create tasks",
+            "create issue",
+            "create issues",
+            "open task",
+            "open ticket",
+            "from context",
+            "based on context",
+        )
+    )
+    return has_linear and has_task_intent
+
+
+def _task_execution_instruction() -> str:
+    team_hint = (
+        f"Use team_id '{LINEAR_DEFAULT_TEAM_ID}' unless the user explicitly asks for a different team."
+        if LINEAR_DEFAULT_TEAM_ID
+        else "If team_id is missing, call list_teams and choose the first team."
+    )
+    return (
+        "Task execution mode is ON for this request.\n"
+        "- Call Linear tools directly in this same response; do not output a plan without tool calls.\n"
+        "- Do not ask for Linear API keys or connection setup.\n"
+        f"- {team_hint}\n"
+        "- Create the issues now and return identifiers + URLs."
+    )
+
+
 # ── Call Open WebUI (non-streaming for reliability) ──────────────────
 
 async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
@@ -136,8 +178,13 @@ async def _call_openwebui(messages: list[dict], chat_id: int, bot: Bot) -> str:
     placeholder = await bot.send_message(chat_id=chat_id, text="Working on it...")
 
     convo_messages = list(messages)
+    linear_task_mode = _is_linear_task_request(convo_messages)
+
     for nudge_round in range(MAX_TOOL_NUDGES + 1):
-        full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + convo_messages
+        full_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if linear_task_mode:
+            full_messages.append({"role": "system", "content": _task_execution_instruction()})
+        full_messages += convo_messages
         payload = {
             "model": OPENWEBUI_MODEL,
             "messages": full_messages,
@@ -389,6 +436,10 @@ async def startup() -> None:
         log.warning(
             "OPENWEBUI_TOOL_IDS is empty. The model may not have access to tool servers (Linear, UXCam, Tableau, etc.)."
         )
+    if LINEAR_DEFAULT_TEAM_ID:
+        log.info("Linear default team configured: %s", LINEAR_DEFAULT_TEAM_ID)
+    else:
+        log.info("LINEAR_DEFAULT_TEAM_ID not set. Bot will resolve team dynamically via list_teams.")
 
     if WEBHOOK_URL:
         webhook_path = f"{WEBHOOK_URL}/webhook"
