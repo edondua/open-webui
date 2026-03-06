@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -25,8 +28,12 @@ TIMEOUT_SECONDS = int(os.getenv("MEMORY_TIMEOUT_SECONDS", "30"))
 VECTOR_INDEX_LISTS = int(os.getenv("MEMORY_VECTOR_INDEX_LISTS", "100"))
 VECTOR_PROBES = int(os.getenv("MEMORY_VECTOR_PROBES", "10"))
 REQUIRE_VECTOR = os.getenv("MEMORY_REQUIRE_VECTOR", "false").lower() in ("1", "true", "yes")
+AI_CONFIG_DIR = Path(os.getenv("AI_CONFIG_DIR", str(Path(__file__).resolve().parent / "ai-config")))
+GLOBAL_PROMPT_PATH = AI_CONFIG_DIR / "GLOBAL_SYSTEM_PROMPT.md"
+PROJECT_KNOWLEDGE_PATH = AI_CONFIG_DIR / "PROJECT_KNOWLEDGE.md"
 
 VECTOR_DB_ENABLED = False
+VECTOR_ERROR: str | None = None
 
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -95,6 +102,26 @@ class SearchResponse(BaseModel):
     items: list[SearchResult]
 
 
+class SessionPrepareRequest(BaseModel):
+    chat_id: str = Field(..., min_length=1, max_length=120)
+    latest_user_message: str = Field(..., min_length=1)
+    role_prompt: str = Field(..., min_length=1)
+    include_knowledge: bool = True
+    include_session_state: bool = True
+
+
+class SessionUpdateRequest(BaseModel):
+    chat_id: str = Field(..., min_length=1, max_length=120)
+    goal: str | None = None
+    decisions: list[str] | None = None
+    blockers: list[str] | None = None
+    next_steps: list[str] | None = None
+    open_questions: list[str] | None = None
+    artifacts: list[str] | None = None
+    active_role: str | None = None
+    status: str | None = None
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -106,6 +133,46 @@ def parse_iso_or_now(value: str | None) -> str:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
     except ValueError:
         return utc_now_iso()
+
+
+def _safe_chat_id(chat_id: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", chat_id.strip())
+    if not safe:
+        raise HTTPException(status_code=400, detail="Invalid chat_id")
+    return safe
+
+
+def _default_session_state(chat_id: str) -> dict[str, Any]:
+    return {
+        "chat_id": chat_id,
+        "updated_at": utc_now_iso(),
+        "goal": "",
+        "decisions": [],
+        "blockers": [],
+        "next_steps": [],
+        "open_questions": [],
+        "artifacts": [],
+        "active_role": "general_engineer",
+        "status": "active",
+    }
+
+
+def _read_text_or_default(path: Path, default_value: str) -> str:
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return default_value
+
+
+def _load_global_prompt() -> str:
+    default_prompt = (
+        "You are an execution-focused software delivery assistant. "
+        "Keep context scoped, execute step-by-step, and return key outputs only."
+    )
+    return _read_text_or_default(GLOBAL_PROMPT_PATH, default_prompt)
+
+
+def _load_project_knowledge() -> str:
+    return _read_text_or_default(PROJECT_KNOWLEDGE_PATH, "No project knowledge configured.")
 
 
 def vec_to_pg_literal(vec: list[float]) -> str:
@@ -126,18 +193,18 @@ def db_conn() -> psycopg.Connection:
 
 
 def init_db() -> None:
-    global VECTOR_DB_ENABLED
+    global VECTOR_DB_ENABLED, VECTOR_ERROR
     with db_conn() as conn:
         with conn.cursor() as cur:
-            vector_error: str | None = None
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
                 VECTOR_DB_ENABLED = True
+                VECTOR_ERROR = None
             except Exception as ex:
                 VECTOR_DB_ENABLED = False
-                vector_error = str(ex)
+                VECTOR_ERROR = str(ex)
                 if REQUIRE_VECTOR:
-                    raise HTTPException(status_code=500, detail=f"pgvector unavailable: {vector_error}")
+                    raise HTTPException(status_code=500, detail=f"pgvector unavailable: {VECTOR_ERROR}")
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS memory_docs (
@@ -172,6 +239,17 @@ def init_db() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_session_state (
+                  chat_id TEXT PRIMARY KEY,
+                  state JSONB NOT NULL,
+                  created_at TIMESTAMPTZ NOT NULL,
+                  updated_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_session_state_updated_at ON chat_session_state (updated_at DESC)")
 
             if VECTOR_DB_ENABLED:
                 cur.execute(f"ALTER TABLE memory_docs ADD COLUMN IF NOT EXISTS embedding vector({EMBEDDING_DIM})")
@@ -209,6 +287,49 @@ def init_db() -> None:
                 )
 
 
+def load_session_state(chat_id: str) -> dict[str, Any]:
+    chat_id = _safe_chat_id(chat_id)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT state FROM chat_session_state WHERE chat_id = %s", (chat_id,))
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                return row[0]
+
+            state = _default_session_state(chat_id)
+            now = utc_now_iso()
+            cur.execute(
+                """
+                INSERT INTO chat_session_state (chat_id, state, created_at, updated_at)
+                VALUES (%s, %s::jsonb, %s, %s)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
+                (chat_id, json.dumps(state), now, now),
+            )
+            return state
+
+
+def save_session_state(state: dict[str, Any]) -> dict[str, Any]:
+    chat_id = _safe_chat_id(str(state.get("chat_id", "")))
+    state["chat_id"] = chat_id
+    state["updated_at"] = utc_now_iso()
+    now = utc_now_iso()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO chat_session_state (chat_id, state, created_at, updated_at)
+                VALUES (%s, %s::jsonb, %s, %s)
+                ON CONFLICT (chat_id)
+                DO UPDATE SET
+                  state = EXCLUDED.state,
+                  updated_at = EXCLUDED.updated_at
+                """,
+                (chat_id, json.dumps(state), now, now),
+            )
+    return state
+
+
 def embed_text(text: str) -> list[float] | None:
     if EMBEDDING_PROVIDER in ("none", "disabled"):
         return None
@@ -240,8 +361,6 @@ def embed_text(text: str) -> list[float] | None:
 
 
 def choose_embedding(explicit: list[float] | None, text_for_embedding: str) -> list[float] | None:
-    if not VECTOR_DB_ENABLED:
-        return None
     if explicit is not None:
         if len(explicit) != EMBEDDING_DIM:
             raise HTTPException(status_code=400, detail=f"embedding length must be {EMBEDDING_DIM}")
@@ -401,6 +520,17 @@ def upsert_evidence(ev: EvidenceIn) -> dict[str, Any]:
     return {"id": record_id, "as_of": as_of, "embedded": vec is not None}
 
 
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def _search_table(
     table: str,
     req: SearchRequest,
@@ -426,9 +556,25 @@ def _search_table(
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-    q_vec_literal = vec_to_pg_literal(q_vec) if (q_vec is not None and VECTOR_DB_ENABLED) else None
+    use_pg_vector = q_vec is not None and VECTOR_DB_ENABLED
+    use_app_vector = q_vec is not None and not VECTOR_DB_ENABLED
+    q_vec_literal = vec_to_pg_literal(q_vec) if use_pg_vector else None
 
-    if q_vec_literal is None:
+    if use_app_vector:
+        # Fetch keyword results + embedding_json for app-level cosine similarity
+        fetch_limit = max(req.limit * 3, 100)
+        sql = f"""
+        SELECT
+          {select_cols},
+          embedding_json,
+          ts_rank_cd(to_tsvector('simple', {fts_expr}), plainto_tsquery('simple', %s)) AS keyword_score
+        FROM {table}
+        {where_clause}
+        ORDER BY keyword_score DESC, {updated_at_col} DESC
+        LIMIT %s
+        """
+        run_params = [req.query, *params, fetch_limit]
+    elif q_vec_literal is None:
         sql = f"""
         SELECT
           {select_cols},
@@ -467,6 +613,23 @@ def _search_table(
             cols = [d.name for d in cur.description]
 
     items = [dict(zip(cols, row)) for row in rows]
+
+    if use_app_vector and q_vec is not None:
+        for item in items:
+            emb_json = item.pop("embedding_json", None)
+            emb = emb_json if isinstance(emb_json, list) else None
+            if emb is None and isinstance(emb_json, str):
+                try:
+                    emb = json.loads(emb_json)
+                except (json.JSONDecodeError, TypeError):
+                    emb = None
+            vec_score = _cosine_similarity(q_vec, emb) if emb and len(emb) == EMBEDDING_DIM else 0.0
+            kw_score = float(item.get("keyword_score", 0.0))
+            item["vector_score"] = vec_score
+            item["score"] = req.weight_keyword * kw_score + req.weight_vector * vec_score
+        items.sort(key=lambda x: (-float(x.get("score", 0.0)),))
+        items = items[: req.limit]
+
     return [x for x in items if float(x.get("score", 0.0)) >= req.min_score]
 
 
@@ -557,8 +720,12 @@ def health() -> dict[str, Any]:
         "embedding_dim": EMBEDDING_DIM,
         "vector_db_enabled": VECTOR_DB_ENABLED,
         "has_database_url": bool(DATABASE_URL),
+        "global_prompt_found": GLOBAL_PROMPT_PATH.exists(),
+        "project_knowledge_found": PROJECT_KNOWLEDGE_PATH.exists(),
+        "ai_config_dir": str(AI_CONFIG_DIR),
         "docs_count": docs_count,
         "evidence_count": evidence_count,
+        "vector_error": VECTOR_ERROR,
     }
 
 
@@ -615,3 +782,60 @@ def search_all(req: SearchRequest) -> SearchResponse:
     all_items = docs + evidence
     all_items.sort(key=lambda x: x.score, reverse=True)
     return SearchResponse(count=len(all_items), items=all_items[: req.limit])
+
+
+@app.get("/v1/session/state/{chat_id}")
+def get_session_state(chat_id: str) -> dict[str, Any]:
+    init_db()
+    state = load_session_state(chat_id)
+    return {"state": state}
+
+
+@app.post("/v1/session/state/update")
+def update_session_state(payload: SessionUpdateRequest) -> dict[str, Any]:
+    init_db()
+    state = load_session_state(payload.chat_id)
+    if payload.goal is not None:
+        state["goal"] = payload.goal
+    if payload.decisions is not None:
+        state["decisions"] = payload.decisions
+    if payload.blockers is not None:
+        state["blockers"] = payload.blockers
+    if payload.next_steps is not None:
+        state["next_steps"] = payload.next_steps
+    if payload.open_questions is not None:
+        state["open_questions"] = payload.open_questions
+    if payload.artifacts is not None:
+        state["artifacts"] = payload.artifacts
+    if payload.active_role is not None:
+        state["active_role"] = payload.active_role
+    if payload.status is not None:
+        state["status"] = payload.status
+
+    saved = save_session_state(state)
+    return {"ok": True, "state": saved}
+
+
+@app.post("/v1/session/prepare")
+def prepare_session_context(payload: SessionPrepareRequest) -> dict[str, Any]:
+    init_db()
+    state = load_session_state(payload.chat_id)
+    save_session_state(state)
+
+    sections = [
+        "[SYSTEM]\n" + _load_global_prompt(),
+        "[ROLE]\n" + payload.role_prompt.strip(),
+    ]
+    if payload.include_knowledge:
+        sections.append("[KNOWLEDGE]\n" + _load_project_knowledge())
+    if payload.include_session_state:
+        sections.append("[SESSION_STATE]\n" + json.dumps(state, ensure_ascii=True, indent=2))
+    sections.append("[USER]\n" + payload.latest_user_message.strip())
+
+    composed_prompt = "\n\n".join(sections)
+    return {
+        "ok": True,
+        "chat_id": payload.chat_id,
+        "state": state,
+        "composed_prompt": composed_prompt,
+    }

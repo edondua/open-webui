@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_TITLE = "Tableau Tools"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 DATA_DIR = Path(os.getenv("TABLEAU_DATA_DIR", "/app/data"))
 DB_PATH = Path(os.getenv("TABLEAU_DB_PATH", str(DATA_DIR / "tableau.db")))
@@ -29,6 +29,8 @@ TABLEAU_API_VERSION = os.getenv("TABLEAU_API_VERSION", "3.24")
 TABLEAU_TIMEOUT_SECONDS = int(os.getenv("TABLEAU_TIMEOUT_SECONDS", "40"))
 TABLEAU_PAGE_SIZE = int(os.getenv("TABLEAU_PAGE_SIZE", "100"))
 TABLEAU_VIEW_DATA_MAX_ROWS = int(os.getenv("TABLEAU_VIEW_DATA_MAX_ROWS", "500"))
+MEMORY_TOOLS_URL = os.getenv("MEMORY_TOOLS_URL", "").rstrip("/")
+MEMORY_TOOLS_API_KEY = os.getenv("MEMORY_TOOLS_API_KEY", "")
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 app.add_middleware(
@@ -56,6 +58,11 @@ class SyncViewDataRequest(BaseModel):
     max_views: int = Field(default=10, ge=1, le=200)
     max_rows_per_view: int = Field(default=500, ge=1, le=10000)
     metadata_max_pages: int = Field(default=10, ge=1, le=200)
+
+
+class PushToMemoryRequest(BaseModel):
+    resource: str = Field(default="all", description="workbooks|views|datasources|view_data|all")
+    limit: int = Field(default=500, ge=1, le=5000)
 
 
 def utc_now_iso() -> str:
@@ -215,11 +222,6 @@ class TableauClient:
             client.post(self._api("/auth/signout"), headers=self._headers(token))
 
     def paged_get(self, token: str, site_id: str, resource: str, max_pages: int) -> list[dict[str, Any]]:
-        # Tableau REST resources:
-        # /sites/{site_id}/workbooks
-        # /sites/{site_id}/views
-        # /sites/{site_id}/datasources
-        # /sites/{site_id}/jobs
         items: list[dict[str, Any]] = []
         page_number = 1
         page_size = TABLEAU_PAGE_SIZE
@@ -274,8 +276,6 @@ class TableauClient:
     def fetch_view_data(self, token: str, site_id: str, view_id: str) -> dict[str, Any]:
         url = self._api(f"/sites/{site_id}/views/{view_id}/data")
         with httpx.Client(timeout=self.timeout) as client:
-            # Tableau Cloud can return 406 when Accept is explicitly text/csv.
-            # Reuse default headers and parse CSV from response body.
             resp = client.get(url, headers=self._headers(token))
         if resp.status_code >= 400:
             raise HTTPException(status_code=502, detail=f"Tableau view data failed {resp.status_code}: {resp.text[:300]}")
@@ -452,6 +452,95 @@ def upsert_view_data_cache(
         )
 
 
+def _memory_headers() -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if MEMORY_TOOLS_API_KEY:
+        headers["Authorization"] = f"Bearer {MEMORY_TOOLS_API_KEY}"
+    return headers
+
+
+def _workbooks_to_docs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        payload = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
+        name = r.get("name") or payload.get("name", "")
+        project = (payload.get("project") or {}).get("name", "")
+        owner = (payload.get("owner") or {}).get("name", "")
+
+        summary = f"Tableau workbook '{name}'"
+        if project:
+            summary += f" in project '{project}'"
+        if owner:
+            summary += f" by {owner}"
+
+        out.append({
+            "id": f"tableau-workbook:{r['tableau_id']}",
+            "kind": "definition",
+            "title": f"Tableau workbook: {name}",
+            "body": summary,
+            "summary": summary,
+            "tags": {"source": "tableau", "type": "workbook", "project": project},
+            "source": "tableau-tools",
+            "updated_at": r.get("updated_at"),
+        })
+    return out
+
+
+def _datasources_to_docs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        payload = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
+        name = r.get("name") or payload.get("name", "")
+        ds_type = payload.get("type", payload.get("contentUrl", ""))
+
+        summary = f"Tableau datasource '{name}'"
+        if ds_type:
+            summary += f" (type={ds_type})"
+
+        out.append({
+            "id": f"tableau-datasource:{r['tableau_id']}",
+            "kind": "definition",
+            "title": f"Tableau datasource: {name}",
+            "body": summary,
+            "summary": summary,
+            "tags": {"source": "tableau", "type": "datasource"},
+            "source": "tableau-tools",
+            "updated_at": r.get("updated_at"),
+        })
+    return out
+
+
+def _view_data_to_evidence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        columns = json.loads(r["columns_json"]) if isinstance(r["columns_json"], str) else r["columns_json"]
+        data_rows = json.loads(r["rows_json"]) if isinstance(r["rows_json"], str) else r["rows_json"]
+        wb_name = r.get("workbook_name") or ""
+        v_name = r.get("view_name") or ""
+        row_count = r.get("row_count", len(data_rows))
+
+        summary = f"Tableau view '{v_name}'"
+        if wb_name:
+            summary += f" from workbook '{wb_name}'"
+        summary += f" with {row_count} rows, columns: {', '.join(columns[:15])}"
+
+        # Include a sample of the data as snippet
+        sample = data_rows[:5] if data_rows else []
+        snippet = json.dumps({"columns": columns, "sample_rows": sample})[:500]
+
+        out.append({
+            "id": f"tableau-viewdata:{r['view_id']}",
+            "question": f"Tableau view data: {v_name} ({wb_name})",
+            "summary": summary,
+            "tool": "tableau-tools",
+            "endpoint": "/data/view-data",
+            "as_of": r.get("fetched_at"),
+            "tags": {"source": "tableau", "type": "view_data", "workbook": wb_name, "view": v_name},
+            "snippet": snippet,
+        })
+    return out
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
@@ -468,6 +557,7 @@ def health() -> dict[str, Any]:
         "has_site": TABLEAU_SITE_NAME is not None,
         "has_pat_name": bool(TABLEAU_PAT_NAME),
         "has_pat_value": bool(TABLEAU_PAT_VALUE),
+        "has_memory_tools": bool(MEMORY_TOOLS_URL),
     }
 
 
@@ -489,7 +579,6 @@ def sync_run(req: SyncRequest) -> dict[str, Any]:
 @app.post("/sync/view-data")
 def sync_view_data(req: SyncViewDataRequest) -> dict[str, Any]:
     init_db()
-    # Refresh metadata first so new workbooks/views added in Tableau are included.
     run_sync("workbooks", req.metadata_max_pages)
     run_sync("views", req.metadata_max_pages)
 
@@ -684,3 +773,79 @@ def data_view_data(
         item["columns"] = json.loads(item.pop("columns_json"))
         item["rows"] = json.loads(item.pop("rows_json"))
     return {"count": len(items), "items": items}
+
+
+@app.post("/push-to-memory")
+def push_to_memory(req: PushToMemoryRequest) -> dict[str, Any]:
+    if not MEMORY_TOOLS_URL:
+        raise HTTPException(status_code=500, detail="MEMORY_TOOLS_URL is not configured")
+    init_db()
+
+    docs: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    resource = req.resource.lower()
+
+    if resource in ("all", "workbooks"):
+        with db_conn() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT tableau_id, name, updated_at, payload FROM workbooks_raw ORDER BY updated_at DESC LIMIT ?",
+                (req.limit,),
+            ).fetchall()]
+        docs.extend(_workbooks_to_docs(rows))
+
+    if resource in ("all", "datasources"):
+        with db_conn() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT tableau_id, name, updated_at, payload FROM datasources_raw ORDER BY updated_at DESC LIMIT ?",
+                (req.limit,),
+            ).fetchall()]
+        docs.extend(_datasources_to_docs(rows))
+
+    if resource in ("all", "view_data"):
+        with db_conn() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT view_id, workbook_id, workbook_name, view_name, row_count, columns_json, rows_json, fetched_at FROM view_data_cache ORDER BY fetched_at DESC LIMIT ?",
+                (req.limit,),
+            ).fetchall()]
+        evidence.extend(_view_data_to_evidence(rows))
+
+    if not docs and not evidence:
+        return {"pushed_docs": 0, "pushed_evidence": 0, "note": "No local data to push"}
+
+    batch_size = 50
+    total_docs = 0
+    total_evidence = 0
+    errors: list[str] = []
+
+    with httpx.Client(timeout=30) as client:
+        for i in range(0, len(docs), batch_size):
+            batch = docs[i : i + batch_size]
+            resp = client.post(
+                f"{MEMORY_TOOLS_URL}/ingest/batch",
+                headers=_memory_headers(),
+                json=batch,
+            )
+            if resp.status_code < 400:
+                total_docs += len(batch)
+            else:
+                errors.append(f"Docs batch {i // batch_size}: {resp.status_code} {resp.text[:200]}")
+
+        for i in range(0, len(evidence), batch_size):
+            batch = evidence[i : i + batch_size]
+            resp = client.post(
+                f"{MEMORY_TOOLS_URL}/evidence/write_batch",
+                headers=_memory_headers(),
+                json=batch,
+            )
+            if resp.status_code < 400:
+                total_evidence += len(batch)
+            else:
+                errors.append(f"Evidence batch {i // batch_size}: {resp.status_code} {resp.text[:200]}")
+
+    return {
+        "pushed_docs": total_docs,
+        "pushed_evidence": total_evidence,
+        "total_docs": len(docs),
+        "total_evidence": len(evidence),
+        "errors": errors,
+    }

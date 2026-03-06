@@ -15,13 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_TITLE = "UXCam Tools"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 DATA_DIR = Path(os.getenv("UXCAM_DATA_DIR", "/app/data"))
 DB_PATH = Path(os.getenv("UXCAM_DB_PATH", str(DATA_DIR / "uxcam.db")))
 
 UXCAM_API_BASE_URL = os.getenv("UXCAM_API_BASE_URL", "").rstrip("/")
 UXCAM_API_KEY = os.getenv("UXCAM_API_KEY", "")
+MEMORY_TOOLS_URL = os.getenv("MEMORY_TOOLS_URL", "").rstrip("/")
+MEMORY_TOOLS_API_KEY = os.getenv("MEMORY_TOOLS_API_KEY", "")
 UXCAM_PROJECT_ID = os.getenv("UXCAM_PROJECT_ID", "")
 UXCAM_APP_ID = os.getenv("UXCAM_APP_ID", "") or UXCAM_PROJECT_ID
 UXCAM_TIMEOUT_SECONDS = int(os.getenv("UXCAM_TIMEOUT_SECONDS", "30"))
@@ -67,6 +69,13 @@ class SyncRequest(BaseModel):
 class ResyncRequest(BaseModel):
     resource: str = Field(default="all", description="sessions | events | all")
     max_pages: int = Field(default=50, ge=1, le=500)
+
+
+class PushToMemoryRequest(BaseModel):
+    resource: str = Field(default="all", description="sessions | events | all")
+    limit: int = Field(default=500, ge=1, le=5000)
+    since: str | None = None
+    until: str | None = None
 
 
 def utc_now_iso() -> str:
@@ -323,6 +332,72 @@ def sync_resource(resource: str, since: str | None, until: str | None, force_ful
     }
 
 
+def _memory_headers() -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if MEMORY_TOOLS_API_KEY:
+        headers["Authorization"] = f"Bearer {MEMORY_TOOLS_API_KEY}"
+    return headers
+
+
+def _sessions_to_evidence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        payload = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
+        device = payload.get("device", payload.get("deviceModel", ""))
+        os_name = payload.get("os", payload.get("operatingSystem", ""))
+        country = payload.get("country", payload.get("countryName", ""))
+        duration = payload.get("duration", payload.get("sessionDuration", ""))
+        screens = payload.get("screenCount", payload.get("screens", ""))
+
+        parts = []
+        if device:
+            parts.append(f"device={device}")
+        if os_name:
+            parts.append(f"os={os_name}")
+        if country:
+            parts.append(f"country={country}")
+        if duration:
+            parts.append(f"duration={duration}s")
+        if screens:
+            parts.append(f"screens={screens}")
+
+        out.append({
+            "id": f"uxcam-session:{r['ux_id']}",
+            "question": f"UXCam session {r['ux_id']}",
+            "summary": f"UXCam session: {', '.join(parts) or json.dumps(payload)[:200]}",
+            "tool": "uxcam-tools",
+            "endpoint": "/data/sessions",
+            "as_of": r.get("occurred_at"),
+            "tags": {"source": "uxcam", "type": "session", "platform": os_name},
+            "snippet": json.dumps(payload)[:500],
+        })
+    return out
+
+
+def _events_to_evidence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        payload = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
+        event_name = payload.get("name", payload.get("eventName", payload.get("type", "unknown")))
+        screen = payload.get("screenName", payload.get("screen", ""))
+
+        summary = f"UXCam event '{event_name}'"
+        if screen:
+            summary += f" on screen '{screen}'"
+
+        out.append({
+            "id": f"uxcam-event:{r['ux_id']}",
+            "question": f"UXCam event: {event_name}",
+            "summary": summary,
+            "tool": "uxcam-tools",
+            "endpoint": "/data/events",
+            "as_of": r.get("occurred_at"),
+            "tags": {"source": "uxcam", "type": "event", "event_name": event_name},
+            "snippet": json.dumps(payload)[:500],
+        })
+    return out
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
@@ -338,6 +413,7 @@ def health() -> dict[str, Any]:
         "has_api_base": bool(UXCAM_API_BASE_URL),
         "has_api_key": bool(UXCAM_API_KEY),
         "has_app_id": bool(UXCAM_APP_ID),
+        "has_memory_tools": bool(MEMORY_TOOLS_URL),
         "auth_mode": UXCAM_AUTH_MODE,
     }
 
@@ -457,3 +533,70 @@ def data_events(
         item["payload"] = json.loads(item["payload"])
         items.append(item)
     return {"count": len(items), "items": items}
+
+
+@app.post("/push-to-memory")
+def push_to_memory(req: PushToMemoryRequest) -> dict[str, Any]:
+    if not MEMORY_TOOLS_URL:
+        raise HTTPException(status_code=500, detail="MEMORY_TOOLS_URL is not configured")
+    init_db()
+
+    evidence: list[dict[str, Any]] = []
+    resource = req.resource.lower()
+
+    if resource in ("all", "sessions"):
+        sql = "SELECT ux_id, occurred_at, payload FROM sessions_raw"
+        wh: list[str] = []
+        params: list[Any] = []
+        if req.since:
+            wh.append("occurred_at >= ?")
+            params.append(req.since)
+        if req.until:
+            wh.append("occurred_at <= ?")
+            params.append(req.until)
+        if wh:
+            sql += " WHERE " + " AND ".join(wh)
+        sql += " ORDER BY occurred_at DESC LIMIT ?"
+        params.append(req.limit)
+        with db_conn() as conn:
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        evidence.extend(_sessions_to_evidence(rows))
+
+    if resource in ("all", "events"):
+        sql = "SELECT ux_id, session_id, occurred_at, payload FROM events_raw"
+        wh = []
+        params = []
+        if req.since:
+            wh.append("occurred_at >= ?")
+            params.append(req.since)
+        if req.until:
+            wh.append("occurred_at <= ?")
+            params.append(req.until)
+        if wh:
+            sql += " WHERE " + " AND ".join(wh)
+        sql += " ORDER BY occurred_at DESC LIMIT ?"
+        params.append(req.limit)
+        with db_conn() as conn:
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        evidence.extend(_events_to_evidence(rows))
+
+    if not evidence:
+        return {"pushed": 0, "note": "No local data to push"}
+
+    batch_size = 50
+    total_pushed = 0
+    errors: list[str] = []
+    with httpx.Client(timeout=30) as client:
+        for i in range(0, len(evidence), batch_size):
+            batch = evidence[i : i + batch_size]
+            resp = client.post(
+                f"{MEMORY_TOOLS_URL}/evidence/write_batch",
+                headers=_memory_headers(),
+                json=batch,
+            )
+            if resp.status_code < 400:
+                total_pushed += len(batch)
+            else:
+                errors.append(f"Batch {i // batch_size}: {resp.status_code} {resp.text[:200]}")
+
+    return {"pushed": total_pushed, "total_evidence": len(evidence), "errors": errors}
